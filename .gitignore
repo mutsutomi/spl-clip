@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 入力素材(録画ファイル)
+*.MOV
+*.mov
+*.mp4
+*.mkv
+*.avi
+
+# 出力・作業ファイル
+clips/
+cache/
+
+# macOS
+.DS_Store
