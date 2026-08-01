@@ -12,7 +12,10 @@ auto_clip.py のブラウザ操作版。
 
 from __future__ import annotations  # 古いPythonでも読み込めるようにする(エラーを分かりやすく)
 
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -139,12 +142,16 @@ def delete_cache(paths: list[Path]):
 
 def render_cache_panel(current_video: Path | None = None):
     """溜まった作業ファイルの量を見せて、その場で削除できるようにする"""
+    kinds = {".wav": "音声", ".jpg": "コマ画像", ".m4a": "再生用の音声", ".mp4": "再生用の映像",
+             ".mov": "再生用の映像", ".mkv": "再生用の映像"}
     files = sorted(
         (p for d in (CACHE_DIR, STATIC_DIR) if d.exists()
-         for p in d.iterdir() if p.suffix in (".wav", ".jpg")),
+         for p in d.iterdir() if p.suffix in kinds),
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
-    total = sum(p.stat().st_size for p in files)
+    # ハードリンクはクリップと実体を共有しているので、容量は二重に数えない
+    shared = {p for p in files if p.stat().st_nlink > 1}
+    total = sum(p.stat().st_size for p in files if p not in shared)
     in_use = set()
     if current_video:
         in_use = {ac.cache_wav_path(current_video, CACHE_DIR)}
@@ -168,8 +175,8 @@ def render_cache_panel(current_video: Path | None = None):
                 {
                     "": "● 使用中" if p in in_use else "",
                     "元の動画": p.name.rsplit("_", 2)[0],
-                    "種類": "音声" if p.suffix == ".wav" else "コマ画像",
-                    "サイズ": fmt_size(p.stat().st_size),
+                    "種類": kinds[p.suffix],
+                    "サイズ": "0 B(クリップと共有)" if p in shared else fmt_size(p.stat().st_size),
                     "最終使用": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
                 }
                 for p in files
@@ -229,6 +236,81 @@ def load_sprite(video_path: str, mtime: float, duration: float):
     meta["url"] = f"app/static/{quote(out.name)}?v={int(out.stat().st_mtime)}"
     meta["path"] = str(out)
     return meta
+
+
+@st.cache_data(show_spinner=False)
+def preview_sources(clip_path: str, mtime: float, n_tracks: int) -> dict:
+    """アプリ内で「全部の音」を鳴らすための素材をそろえる。
+
+    動画本体はハードリンクなので容量は増えない(実体はクリップと同じ)。
+    2本目以降の音声だけを取り出して、動画と同時に再生させる。
+    """
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    clip = Path(clip_path)
+    tag = hashlib.sha1(f"{clip.resolve()}:{mtime}".encode()).hexdigest()[:8]
+
+    video = STATIC_DIR / f"prev_{tag}{clip.suffix}"
+    if not video.exists():
+        try:
+            os.link(clip, video)          # 容量ゼロで同じ実体を指す
+        except OSError:
+            shutil.copy2(clip, video)     # 別ディスクなどでリンクできない場合だけ複製
+
+    extras = []
+    for i in range(1, n_tracks):
+        a = STATIC_DIR / f"prev_{tag}_a{i}.m4a"
+        if not a.exists():
+            try:
+                ac.extract_track_audio(clip, a, i)
+            except (OSError, subprocess.CalledProcessError):
+                continue
+        if a.exists():
+            extras.append(f"app/static/{quote(a.name)}")
+    return {"video": f"app/static/{quote(video.name)}", "extras": extras}
+
+
+PLAYER_TEMPLATE = """
+<meta charset="utf-8">
+<style>
+  body { margin: 0; background: transparent;
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  video { width: 100%; max-height: 420px; background: #000; border-radius: 6px; }
+</style>
+<video id="v" controls preload="metadata" src="__VIDEO__"></video>
+<div id="extras"></div>
+<script>
+const EXTRAS = __EXTRAS__;
+const v = document.getElementById("v");
+const box = document.getElementById("extras");
+
+// 追加の音声(マイクなど)。動画に合わせて鳴らす
+const tracks = EXTRAS.map(src => {
+  const a = document.createElement("audio");
+  a.src = src; a.preload = "metadata"; a.style.display = "none";
+  box.appendChild(a);
+  return a;
+});
+
+const each = fn => tracks.forEach(fn);
+const align = () => each(a => { if (Math.abs(a.currentTime - v.currentTime) > 0.2) a.currentTime = v.currentTime; });
+
+v.addEventListener("play",  () => { align(); each(a => a.play().catch(() => {})); });
+v.addEventListener("pause", () => each(a => a.pause()));
+v.addEventListener("ended", () => each(a => a.pause()));
+v.addEventListener("seeking", () => each(a => { a.currentTime = v.currentTime; }));
+v.addEventListener("waiting", () => each(a => a.pause()));
+v.addEventListener("playing", () => { align(); each(a => a.play().catch(() => {})); });
+v.addEventListener("ratechange", () => each(a => { a.playbackRate = v.playbackRate; }));
+v.addEventListener("volumechange", () => each(a => { a.volume = v.volume; a.muted = v.muted; }));
+v.addEventListener("timeupdate", align);   // ずれてきたら合わせ直す
+</script>
+"""
+
+
+def player_html(src: dict) -> str:
+    return (PLAYER_TEMPLATE
+            .replace("__VIDEO__", src["video"])
+            .replace("__EXTRAS__", json.dumps(src["extras"])))
 
 
 CHART_TEMPLATE = """
@@ -542,27 +624,40 @@ if st.button(f"{len(clips)} 本のクリップを書き出す", type="primary"):
     for i, (s, e) in enumerate(clips, 1):
         out = OUT_DIR / f"clip_{i:03d}_{ac.sec_to_hms(s).replace(':', '')}.mp4"
         bar.progress((i - 1) / len(clips), text=f"{out.name} を書き出し中…({i}/{len(clips)})")
-        ac.ffmpeg("-ss", f"{s:.1f}", "-i", video, "-t", f"{e - s:.1f}", "-c", "copy", out)
+        ac.ffmpeg("-ss", f"{s:.1f}", "-i", video, "-t", f"{e - s:.1f}",
+                  *ac.CUT_MAP, "-c", "copy", out)
         written.append(str(out))
     bar.progress(1.0, text=f"完了! {len(written)} 本を書き出しました")
     st.session_state["written"] = written
 
-if st.session_state.get("written"):
-    written = st.session_state["written"]
+written = [p for p in st.session_state.get("written", []) if Path(p).is_file()]
+if written:
     st.success(f"{OUT_DIR}/ に {len(written)} 本のクリップがあります")
     if st.button("📂 フォルダを開く"):
         opener = "explorer" if sys.platform.startswith("win") else "open"
         subprocess.run([opener, str(OUT_DIR.resolve())])
 
     st.subheader("⑤ 中身を確認する")
-    st.caption(
-        "ここで再生できない場合でもファイル自体は正常です"
-        "(iPhone録画などブラウザが対応しない形式のことがあります)。"
-        "その場合は「フォルダを開く」から QuickTime などで確認してください。"
+    pick = st.selectbox(
+        "確認するクリップ", options=range(len(written)),
+        format_func=lambda k: Path(written[k]).name,
     )
-    for path in written:
-        with st.expander(Path(path).name):
-            st.video(path)
+    n_tracks = len(tracks) if tracks else 1
+    with st.spinner("再生の準備をしています…"):
+        src = preview_sources(written[pick], Path(written[pick]).stat().st_mtime, n_tracks)
+    st.iframe(player_html(src), height=460)
+
+    if src["extras"]:
+        st.caption(
+            f"この動画は音声が {n_tracks} 本あります。ブラウザは1本しか鳴らせないため、"
+            "残りを重ねて同時に再生しています(音量は変えていません)。"
+            "書き出したクリップ自体は元動画と同じ構成のままです。"
+        )
+    st.caption(
+        "映像が出ない場合でもファイルは正常です"
+        "(iPhone録画などブラウザが対応しない形式のことがあります)。"
+        "その場合は「📂 フォルダを開く」から QuickTime などで確認してください。"
+    )
 
 st.divider()
 render_cache_panel(video)

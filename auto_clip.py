@@ -49,6 +49,11 @@ def tool(name: str) -> str:
     return str(exe) if exe.exists() else name
 
 
+# 切り出し時に含めるストリーム。音声を明示しないと ffmpeg が「一番良い1本」だけを選び、
+# OBSのマルチトラック録画ではマイクの音声が捨てられてしまう。
+CUT_MAP = ("-map", "0:v:0", "-map", "0:a")
+
+
 def sec_to_hms(t: float) -> str:
     h, rem = divmod(int(t), 3600)
     m, s = divmod(rem, 60)
@@ -151,6 +156,31 @@ def make_sprite(video: Path, out: Path, duration: float) -> dict | None:
 
     size = probe_size(out)
     return sprite_meta(duration, size) if size else None
+
+
+def mix_preview(clip: Path, out: Path, n_tracks: int):
+    """再生確認用に、音声を1本へ重ねた動画を作る。
+
+    ブラウザは動画に複数の音声が入っていても1本しか鳴らせないため、
+    アプリの画面で「ゲーム音とマイクの両方」を聞くにはこれが要る。
+    normalize=0 なので各音声の大きさは元のまま足し合わされ、音量バランスは変わらない。
+    映像は無劣化のままコピーするので、書き出しは短時間で済む。
+    """
+    srcs = "".join(f"[0:a:{i}]" for i in range(n_tracks))
+    ffmpeg("-i", clip,
+           "-filter_complex", f"{srcs}amix=inputs={n_tracks}:normalize=0[a]",
+           "-map", "0:v:0", "-map", "[a]",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", 192_000, out)
+
+
+def extract_track_audio(clip: Path, out: Path, track: int):
+    """指定した音声トラックだけを、再エンコードせずに取り出す。
+
+    ブラウザは動画に入っている2本目以降の音声を鳴らせないため、画面で全部の音を
+    聞くには、追加ぶんを別ファイルにして動画と同時に再生させる必要がある。
+    音を作り変えないので、音量バランスは元のまま。
+    """
+    ffmpeg("-i", clip, "-map", f"0:a:{track}", "-vn", "-c:a", "copy", out)
 
 
 def extract_audio(video: Path, wav: Path, track: int, refresh: bool):
@@ -260,7 +290,8 @@ def main():
     for i, (s, e) in enumerate(clips, 1):
         out = args.out_dir / f"clip_{i:03d}_{sec_to_hms(s).replace(':', '')}.mp4"
         print(f"[cut] {out.name} を書き出し中...")
-        ffmpeg("-ss", f"{s:.1f}", "-i", args.video, "-t", f"{e - s:.1f}", "-c", "copy", out)
+        ffmpeg("-ss", f"{s:.1f}", "-i", args.video, "-t", f"{e - s:.1f}",
+               *CUT_MAP, "-c", "copy", out)
 
     print(f"\n完了! {len(clips)} 本のクリップを {args.out_dir}/ に書き出しました")
 
