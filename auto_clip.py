@@ -15,6 +15,7 @@
 import argparse
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -70,10 +71,65 @@ def describe_track(i: int, stream: dict) -> str:
     return f"{name}({title})" if title else name
 
 
-def cache_wav_path(video: Path, cache_dir: Path) -> Path:
-    """動画ごとに一意な検出用WAVのパス。別フォルダにある同名の動画とぶつからないようにする"""
+def cache_path(video: Path, cache_dir: Path, kind: str, ext: str) -> Path:
+    """動画ごとに一意な作業ファイルのパス。別フォルダにある同名の動画とぶつからないようにする"""
     tag = hashlib.sha1(str(video.resolve()).encode()).hexdigest()[:8]
-    return cache_dir / f"{video.stem}_{tag}_audio.wav"
+    return cache_dir / f"{video.stem}_{tag}_{kind}.{ext}"
+
+
+def cache_wav_path(video: Path, cache_dir: Path) -> Path:
+    """検出用WAVのパス"""
+    return cache_path(video, cache_dir, "audio", "wav")
+
+
+def sprite_path(video: Path, cache_dir: Path) -> Path:
+    """プレビュー用サムネイル(コマ画像を1枚にまとめたもの)のパス"""
+    return cache_path(video, cache_dir, "sprite", "jpg")
+
+
+def probe_size(image: Path) -> tuple[int, int] | None:
+    """画像の縦横サイズ"""
+    cmd = ["ffprobe", "-hide_banner", "-loglevel", "error", "-select_streams", "v",
+           "-show_entries", "stream=width,height", "-of", "json", str(image)]
+    try:
+        s = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
+        st = s["streams"][0]
+        return int(st["width"]), int(st["height"])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError, IndexError):
+        return None
+
+
+SPRITE_INTERVAL = 5.0  # 何秒ごとにコマを取るか
+SPRITE_WIDTH = 160     # コマ1枚の横幅(px)
+SPRITE_COLS = 12       # 横に並べる枚数
+
+
+def sprite_meta(duration: float, size: tuple[int, int]) -> dict:
+    """サムネイル画像のタイル構成。生成時と読み込み時で同じ計算をする"""
+    count = max(1, math.ceil(duration / SPRITE_INTERVAL))
+    rows = math.ceil(count / SPRITE_COLS)
+    return {
+        "cols": SPRITE_COLS, "rows": rows, "count": count, "interval": SPRITE_INTERVAL,
+        "tile_w": size[0] // SPRITE_COLS, "tile_h": size[1] // rows,
+    }
+
+
+def make_sprite(video: Path, out: Path, duration: float) -> dict | None:
+    """一定間隔のコマを1枚のJPEGに並べる(YouTubeのシークバー画像と同じ仕組み)。
+
+    キーフレームだけを読む(-skip_frame nokey)ので、全部を読む場合の1/3ほどの時間で済む。
+    """
+    meta = sprite_meta(duration, (0, 0))
+    try:
+        ffmpeg("-skip_frame", "nokey", "-i", video,
+               "-vf", f"fps=1/{SPRITE_INTERVAL},scale={SPRITE_WIDTH}:-1,"
+                      f"tile={SPRITE_COLS}x{meta['rows']}",
+               "-frames:v", 1, "-q:v", 7, out)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    size = probe_size(out)
+    return sprite_meta(duration, size) if size else None
 
 
 def extract_audio(video: Path, wav: Path, track: int, refresh: bool):
