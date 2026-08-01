@@ -1,0 +1,10 @@
+# 起動時にターミナルでメールアドレスを聞かれないようにする(ブラウザは起動.command側で開く)
+[server]
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "viewer"

@@ -13,6 +13,8 @@
 """
 
 import argparse
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -46,6 +48,34 @@ def ffmpeg(*args):
     subprocess.run(cmd, check=True)
 
 
+def audio_tracks(video: Path) -> list[dict] | None:
+    """動画に入っている音声トラックの一覧。調べられなかった場合は None"""
+    cmd = [
+        "ffprobe", "-hide_banner", "-loglevel", "error", "-select_streams", "a",
+        "-show_entries", "stream=codec_name,channels:stream_tags=title",
+        "-of", "json", str(video),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        return json.loads(out).get("streams", [])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
+def describe_track(i: int, stream: dict) -> str:
+    """「トラック 1: モノラル(マイク)」のような説明文をつくる"""
+    ch = {1: "モノラル", 2: "ステレオ"}.get(stream.get("channels"), f"{stream.get('channels', '?')}ch")
+    title = (stream.get("tags") or {}).get("title")
+    name = f"トラック {i}: {ch}"
+    return f"{name}({title})" if title else name
+
+
+def cache_wav_path(video: Path, cache_dir: Path) -> Path:
+    """動画ごとに一意な検出用WAVのパス。別フォルダにある同名の動画とぶつからないようにする"""
+    tag = hashlib.sha1(str(video.resolve()).encode()).hexdigest()[:8]
+    return cache_dir / f"{video.stem}_{tag}_audio.wav"
+
+
 def extract_audio(video: Path, wav: Path, track: int, refresh: bool):
     """検出用のWAVを抽出する。前回のものがあれば再利用(パラメータ調整の再実行が速くなる)"""
     if wav.exists() and not refresh:
@@ -55,8 +85,8 @@ def extract_audio(video: Path, wav: Path, track: int, refresh: bool):
     ffmpeg("-i", video, "-map", f"0:a:{track}", "-vn", "-ac", 1, "-ar", 16000, wav)
 
 
-def detect_peaks(wav: Path, win_sec: float, percentile: float) -> list[float]:
-    """RMS音量が上位percentile%を超えた時刻(秒)のリストを返す"""
+def compute_rms(wav: Path, win_sec: float) -> np.ndarray:
+    """WAVをwin_sec秒ごとに区切り、各区間のRMS音量を返す(重いのでUI側ではキャッシュする)"""
     with wave.open(str(wav), "rb") as w:
         sr = w.getframerate()
         raw = w.readframes(w.getnframes())
@@ -64,12 +94,22 @@ def detect_peaks(wav: Path, win_sec: float, percentile: float) -> list[float]:
 
     win = int(sr * win_sec)
     n_win = len(data) // win
-    rms = np.sqrt((data[: n_win * win].reshape(n_win, win) ** 2).mean(axis=1))
+    return np.sqrt((data[: n_win * win].reshape(n_win, win) ** 2).mean(axis=1))
 
+
+def peak_times(rms: np.ndarray, win_sec: float, percentile: float) -> list[float]:
+    """RMS音量が上位percentile%を超えた時刻(秒)のリストを返す"""
     th = np.percentile(rms, percentile)
-    times = [i * win_sec for i in range(n_win) if rms[i] >= th]
-    print(f"[detect] 動画の長さ: {sec_to_hms(n_win * win_sec)} / "
-          f"閾値(上位{100 - percentile:g}%): {th:.0f} / ヒット: {len(times)}箇所")
+    return [i * win_sec for i in range(len(rms)) if rms[i] >= th]
+
+
+def detect_peaks(wav: Path, win_sec: float, percentile: float) -> list[float]:
+    """WAVを解析し、音量ピークの時刻(秒)のリストを返す"""
+    rms = compute_rms(wav, win_sec)
+    times = peak_times(rms, win_sec, percentile)
+    print(f"[detect] 動画の長さ: {sec_to_hms(len(rms) * win_sec)} / "
+          f"閾値(上位{100 - percentile:g}%): {np.percentile(rms, percentile):.0f} / "
+          f"ヒット: {len(times)}箇所")
     return times
 
 
@@ -106,11 +146,19 @@ def main():
     if not args.video.exists():
         sys.exit(f"動画ファイルが見つかりません: {args.video}")
 
+    tracks = audio_tracks(args.video)
+    if tracks is not None:
+        if not tracks:
+            sys.exit(f"この動画には音声が入っていません: {args.video.name}")
+        if args.track >= len(tracks):
+            avail = "\n".join("  " + describe_track(i, s) for i, s in enumerate(tracks))
+            sys.exit(f"音声トラック {args.track} はありません。この動画にあるのは:\n{avail}")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) 音声抽出(キャッシュあり)
-    wav = args.cache_dir / f"{args.video.stem}_audio.wav"
+    wav = cache_wav_path(args.video, args.cache_dir)
     extract_audio(args.video, wav, args.track, args.refresh_audio)
 
     # 2) 音量ピーク検出
