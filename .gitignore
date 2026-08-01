@@ -15,6 +15,7 @@ venv/
 clips/
 cache/
 static/
+settings.json
 
 # 準備スクリプトが取得するffmpeg(125MBほどある)
 bin/

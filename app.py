@@ -46,6 +46,76 @@ THEMES = {
 }
 
 
+SETTINGS_FILE = Path("settings.json")
+
+# 保存する設定と既定値。トラック選択は保存しない(誤った選択が残り続けるのを避けるため、毎回選ぶ)
+SETTING_DEFAULTS = {
+    "percentile": float(ac.CONFIG["percentile"]),
+    "before": int(ac.CONFIG["before_sec"]),
+    "after": int(ac.CONFIG["after_sec"]),
+    "gap": int(ac.CONFIG["merge_gap_sec"]),
+    "zoom": "大",
+    "out_dir": str(OUT_DIR.resolve()),
+}
+
+
+def load_settings() -> dict:
+    """前回の設定を読み込む。壊れていたり値が不正な項目は、黙って既定値に戻す。
+
+    キーの増減はここで自然に吸収される(ファイルに無いキーは既定値、知らないキーは無視)。
+    このファイルは失っても「設定を合わせ直すだけ」なので、移行処理は持たない。
+    """
+    s = dict(SETTING_DEFAULTS)
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return s
+    if not isinstance(raw, dict):
+        return s
+
+    v = raw.get("percentile")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and 95.0 <= v <= 99.9:
+        s["percentile"] = float(v)
+    for key, hi in (("before", 180), ("after", 180), ("gap", 120)):
+        v = raw.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= hi:
+            s[key] = v
+    if raw.get("zoom") in ("標準", "大", "特大"):
+        s["zoom"] = raw["zoom"]
+    v = raw.get("out_dir")
+    if isinstance(v, str) and v.strip():
+        s["out_dir"] = v
+    return s
+
+
+def current_settings(prev: dict) -> dict:
+    """画面部品の現在値から設定を組み立てる。部品がまだ無い・値が不正な項目は前回の値を保つ"""
+    s = dict(prev)
+    ss = st.session_state
+    v = ss.get("set_percentile")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and 95.0 <= v <= 99.9:
+        s["percentile"] = float(v)
+    for key, hi in (("before", 180), ("after", 180), ("gap", 120)):
+        v = ss.get(f"set_{key}")
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= hi:
+            s[key] = v
+    if ss.get("set_zoom") in ("標準", "大", "特大"):
+        s["zoom"] = ss["set_zoom"]
+    v = ss.get("out_dir_input")
+    if isinstance(v, str) and v.strip():
+        s["out_dir"] = str(Path(v.strip().strip('"')).expanduser())
+    return s
+
+
+def save_settings(s: dict):
+    try:
+        SETTINGS_FILE.write_text(
+            json.dumps(s, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass  # 保存できなくても、その場の動作には影響させない
+
+
 def theme() -> dict:
     try:
         return THEMES["dark" if st.context.theme.type == "dark" else "light"]
@@ -555,6 +625,39 @@ def volume_chart_html(rms, win_sec, threshold, clips, duration, sprite, c,
 st.set_page_config(page_title="spl-clip", page_icon="🎬", layout="wide")
 st.title("🎬 盛り上がった瞬間を切り出す")
 
+# 設定ファイルはセッション開始時に一度だけ読み、以後は画面部品の状態を正とする。
+# 毎回読み直して初期値に使うと、保存が追いつかないタイミングの操作で
+# スライダーが古い値に巻き戻って見えることがある。
+if "saved_settings" not in st.session_state:
+    st.session_state["saved_settings"] = load_settings()
+    _s0 = st.session_state["saved_settings"]
+    for _k in ("percentile", "before", "after", "gap", "zoom"):
+        st.session_state[f"set_{_k}"] = _s0[_k]
+    st.session_state["out_dir_input"] = _s0["out_dir"]
+
+    # 確認用の一時切り出し(prevc_*)はセッション限りで捨てる。長い動画では1本100MB超に
+    # なり、溜まって static/ が1GBを超えると Streamlit が配信自体を止めてしまい、
+    # サムネイルもプレーヤーも表示されなくなるため。消えても0.2秒で作り直される。
+    for _p in STATIC_DIR.glob("prevc_*"):
+        try:
+            _p.unlink()
+        except OSError:
+            pass
+    preview_candidate.clear()
+
+# 部品の状態に毎回触れておく。Streamlitは「その回に描画されなかった部品」の状態を
+# 捨てるため、途中で止まる画面(トラック選択など)を挟むとスライダーの値が消えてしまう
+for _k in ("set_percentile", "set_before", "set_after", "set_gap", "set_zoom", "out_dir_input"):
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
+
+# 設定の保存は重い処理より先にやる。以前はスクリプトの最後で保存していたため、
+# 確認用切り出しなどの最中にリロードされると、変更が保存前に失われていた
+_now = current_settings(st.session_state["saved_settings"])
+if _now != st.session_state["saved_settings"]:
+    save_settings(_now)
+    st.session_state["saved_settings"] = _now
+
 # ---------------- ① 動画を選ぶ ----------------
 st.subheader("① 動画を選ぶ")
 c_path, c_browse = st.columns([7, 1.4], vertical_alignment="bottom")
@@ -647,13 +750,13 @@ st.caption(f"長さ {ac.sec_to_hms(total_sec)} / 音声トラック {int(track)}
 st.subheader("② 切り出し方を決める")
 c1, c2, c3, c4 = st.columns(4)
 percentile = c1.slider(
-    "しきい値(上位%)", min_value=95.0, max_value=99.9, value=ac.CONFIG["percentile"], step=0.1,
+    "しきい値(上位%)", min_value=95.0, max_value=99.9, step=0.1, key="set_percentile",
     help="音量が上位何%なら盛り上がりとみなすか。数字を下げるほど候補が増えます",
 )
-before = c2.slider("何秒前から", 0, 180, int(ac.CONFIG["before_sec"]), 5)
-after = c3.slider("何秒後まで", 0, 180, int(ac.CONFIG["after_sec"]), 5)
+before = c2.slider("何秒前から", 0, 180, step=5, key="set_before")
+after = c3.slider("何秒後まで", 0, 180, step=5, key="set_after")
 gap = c4.slider(
-    "まとめる間隔(秒)", 0, 120, int(ac.CONFIG["merge_gap_sec"]), 5,
+    "まとめる間隔(秒)", 0, 120, step=5, key="set_gap",
     help="盛り上がり同士がこの秒数以内なら、1本のクリップにまとめます",
 )
 
@@ -677,7 +780,7 @@ st.caption(
 c_ttl, c_zoom = st.columns([5, 2], vertical_alignment="bottom")
 c_ttl.markdown("**音量の推移**")
 zoom = c_zoom.selectbox(
-    "サムネイルの大きさ", ["標準", "大", "特大"], index=1,
+    "サムネイルの大きさ", ["標準", "大", "特大"], key="set_zoom",
     help="カーソルを合わせたときに出るコマ映像の表示サイズ(標準240 / 大360 / 特大480ピクセル)",
 )
 with st.spinner("プレビュー用のコマ画像を用意しています…(この動画では最初の1回だけ)"):
@@ -765,13 +868,12 @@ c_out, c_ob = st.columns([6, 1.4], vertical_alignment="bottom")
 if c_ob.button("📁 参照", key="browse_out", width="stretch"):
     picked_dir = pick_folder_dialog()
     if picked_dir:
-        st.session_state["out_dir"] = picked_dir
+        st.session_state["out_dir_input"] = picked_dir
         st.rerun()
     else:
         st.toast("フォルダが選ばれませんでした")
 out_str = c_out.text_input(
-    "書き出し先フォルダ",
-    value=st.session_state.get("out_dir", str(OUT_DIR.resolve())),
+    "書き出し先フォルダ", key="out_dir_input",
     help="クリップ動画の保存先です。再生確認用の作業ファイルはここには作られません",
 )
 out_dir = Path(out_str.strip().strip('"')).expanduser()
