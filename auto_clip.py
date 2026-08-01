@@ -187,9 +187,9 @@ def cache_wav_path(video: Path, cache_dir: Path) -> Path:
 def sprite_path(video: Path, cache_dir: Path, interval: float) -> Path:
     """プレビュー用サムネイル(コマ画像を1枚にまとめたもの)のパス。
 
-    間隔を名前に含めるので、間隔が変わったときは自動的に別ファイルとして作り直される。
+    間隔と解像度を名前に含めるので、設定が変わったときは自動的に別ファイルとして作り直される。
     """
-    return cache_path(video, cache_dir, f"sprite{int(interval)}s", "jpg")
+    return cache_path(video, cache_dir, f"sprite{int(interval)}s{SPRITE_WIDTH}w", "jpg")
 
 
 def probe_size(image: Path) -> tuple[int, int] | None:
@@ -205,7 +205,7 @@ def probe_size(image: Path) -> tuple[int, int] | None:
 
 
 SPRITE_INTERVAL = 5.0    # 何秒ごとにコマを取るか(短めの動画のとき)
-SPRITE_WIDTH = 160       # コマ1枚の横幅(px)
+SPRITE_WIDTH = 240       # コマ1枚の横幅(px)。表示で拡大してもぼやけない程度に大きめ
 SPRITE_COLS = 12         # 横に並べる枚数
 SPRITE_MAX_TILES = 1000  # コマ数の上限。長い動画で画像が巨大になりブラウザが描けなくなるのを防ぐ
 

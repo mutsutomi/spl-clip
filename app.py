@@ -14,8 +14,6 @@ from __future__ import annotations  # 古いPythonでも読み込めるように
 
 import hashlib
 import json
-import os
-import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -79,6 +77,25 @@ def pick_file_dialog() -> str | None:
         )
     else:
         return None  # Linux などはパス入力欄を使ってもらう
+    return r.stdout.strip() or None
+
+
+def pick_folder_dialog() -> str | None:
+    """OSの「フォルダを選ぶ」ダイアログを開いてパスを返す(キャンセル時は None)"""
+    if sys.platform == "darwin":
+        script = 'POSIX path of (choose folder with prompt "クリップの書き出し先フォルダを選んでください")'
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    elif sys.platform.startswith("win"):
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$d.Description = 'クリップの書き出し先フォルダを選んでください';"
+            "if ($d.ShowDialog() -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }"
+        )
+        r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                           capture_output=True, text=True)
+    else:
+        return None
     return r.stdout.strip() or None
 
 
@@ -158,8 +175,11 @@ def delete_cache(paths: list[Path]):
             p.unlink()
         except OSError as e:
             st.warning(f"{p.name} を削除できませんでした: {e}")
-    load_rms.clear()     # 解析結果のキャッシュも一緒に捨てる
+    # メモリ上の解析結果・切り出し済み一時ファイルの記録も一緒に捨てる
+    load_rms.clear()
     load_sprite.clear()
+    load_track_info.clear()
+    preview_candidate.clear()
     st.rerun()
 
 
@@ -175,6 +195,14 @@ def render_cache_panel(current_video: Path | None = None):
     # ハードリンクはクリップと実体を共有しているので、容量は二重に数えない
     shared = {p for p in files if p.stat().st_nlink > 1}
     total = sum(p.stat().st_size for p in files if p not in shared)
+
+    # 溜まりすぎたら、折りたたみを開かなくても気づけるように警告を出す
+    if total > 1_000_000_000:
+        st.warning(
+            f"作業ファイルが合計 {fmt_size(total)} になっています。"
+            "下の「🗂 作業ファイル」を開いて「すべて削除」すると空にできます"
+            "(消しても、次に使うときに自動で作り直されます)。"
+        )
     in_use = set()
     if current_video:
         in_use = {ac.cache_wav_path(current_video, CACHE_DIR)}
@@ -262,26 +290,27 @@ def load_sprite(video_path: str, mtime: float, duration: float):
 
 
 @st.cache_data(show_spinner=False)
-def preview_sources(clip_path: str, mtime: float, n_tracks: int) -> dict:
-    """アプリ内で「全部の音」を鳴らすための素材をそろえる。
+def preview_candidate(video_path: str, mtime: float, s: float, e: float, n_tracks: int):
+    """候補の区間を一時ファイルとして切り出し、画面で再生できる形にする。
 
-    動画本体はハードリンクなので容量は増えない(実体はクリップと同じ)。
-    2本目以降の音声だけを取り出して、動画と同時に再生させる。
+    書き出しとまったく同じコマンドで切るので、見えるものは書き出し結果と一致する。
+    成果物ではなく static/ に置く作業ファイルなので、いつ消してもよい。
     """
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-    clip = Path(clip_path)
-    tag = hashlib.sha1(f"{clip.resolve()}:{mtime}".encode()).hexdigest()[:8]
+    video = Path(video_path)
+    tag = hashlib.sha1(f"{video.resolve()}:{mtime}:{s:.1f}:{e:.1f}".encode()).hexdigest()[:8]
 
-    video = STATIC_DIR / f"prev_{tag}{clip.suffix}"
-    if not video.exists():
+    clip = STATIC_DIR / f"prevc_{tag}.mp4"
+    if not clip.exists():
         try:
-            os.link(clip, video)          # 容量ゼロで同じ実体を指す
-        except OSError:
-            shutil.copy2(clip, video)     # 別ディスクなどでリンクできない場合だけ複製
+            ac.ffmpeg("-ss", f"{s:.1f}", "-i", video, "-t", f"{e - s:.1f}",
+                      *ac.CUT_MAP, "-c", "copy", clip)
+        except (OSError, subprocess.CalledProcessError):
+            return None
 
     extras = []
     for i in range(1, n_tracks):
-        a = STATIC_DIR / f"prev_{tag}_a{i}.m4a"
+        a = STATIC_DIR / f"prevc_{tag}_a{i}.m4a"
         if not a.exists():
             try:
                 ac.extract_track_audio(clip, a, i)
@@ -289,7 +318,8 @@ def preview_sources(clip_path: str, mtime: float, n_tracks: int) -> dict:
                 continue
         if a.exists():
             extras.append(f"app/static/{quote(a.name)}")
-    return {"video": f"app/static/{quote(video.name)}", "extras": extras}
+    return {"video": f"app/static/{quote(clip.name)}?v={int(clip.stat().st_mtime)}",
+            "extras": extras}
 
 
 PLAYER_TEMPLATE = """
@@ -298,8 +328,20 @@ PLAYER_TEMPLATE = """
   body { margin: 0; background: transparent;
          font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   video { width: 100%; max-height: 420px; background: #000; border-radius: 6px; }
+  #bar { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
+  #bar button { font: 13px system-ui, -apple-system, "Segoe UI", sans-serif;
+                padding: 6px 16px; border-radius: 6px; cursor: pointer;
+                border: 1px solid rgba(128,128,128,.4); background: transparent; color: #444; }
+  #bar button:hover { background: rgba(128,128,128,.15); }
+  @media (prefers-color-scheme: dark) { #bar button { color: #ddd; } }
 </style>
 <video id="v" controls preload="metadata" src="__VIDEO__"></video>
+<div id="bar">
+  <button data-d="-30">« 30秒</button>
+  <button data-d="-5">‹ 5秒</button>
+  <button data-d="5">5秒 ›</button>
+  <button data-d="30">30秒 »</button>
+</div>
 <div id="extras"></div>
 <script>
 const EXTRAS = __EXTRAS__;
@@ -326,6 +368,12 @@ v.addEventListener("playing", () => { align(); each(a => a.play().catch(() => {}
 v.addEventListener("ratechange", () => each(a => { a.playbackRate = v.playbackRate; }));
 v.addEventListener("volumechange", () => each(a => { a.volume = v.volume; a.muted = v.muted; }));
 v.addEventListener("timeupdate", align);   // ずれてきたら合わせ直す
+
+// 前後送りボタン(追加音声は seeking イベント経由で追従する)
+document.querySelectorAll("#bar button").forEach(b => b.onclick = () => {
+  const d = parseFloat(b.dataset.d);
+  v.currentTime = Math.max(0, Math.min(v.duration || 1e9, v.currentTime + d));
+});
 </script>
 """
 
@@ -370,13 +418,15 @@ root.style.setProperty("--muted", C.muted);
 const PAD = { l: 8, r: 8, t: 10, b: 22 };
 const step = D.t.length > 1 ? D.t[1] - D.t[0] : 1;
 const vmax = Math.max(Math.max.apply(null, D.v), D.threshold) * 1.06 || 1;
-const bandH = D.sprite ? D.sprite.tile_h : 0;
+const SC = D.spriteScale || 1;   // サムネイルの表示倍率(元画像をCSSで拡大する)
+const bandH = D.sprite ? Math.round(D.sprite.tile_h * SC) : 0;
 band.style.height = (D.sprite ? bandH : 26) + "px";
 
 if (D.sprite) {
-  shot.style.width = D.sprite.tile_w + "px";
-  shot.style.height = D.sprite.tile_h + "px";
+  shot.style.width = Math.round(D.sprite.tile_w * SC) + "px";
+  shot.style.height = Math.round(D.sprite.tile_h * SC) + "px";
   shot.style.backgroundImage = "url(" + D.sprite.url + ")";
+  shot.style.backgroundSize = Math.round(D.sprite.cols * D.sprite.tile_w * SC) + "px auto";
   hint.textContent = "グラフにカーソルを合わせると、その瞬間の映像が出ます";
 } else {
   hint.textContent = "";
@@ -465,8 +515,9 @@ function onMove(e) {
   const s = D.sprite;
   const idx = Math.min(s.count - 1, Math.floor(t / s.interval));
   const col = idx % s.cols, row = Math.floor(idx / s.cols);
-  shot.style.backgroundPosition = `-${col * s.tile_w}px -${row * s.tile_h}px`;
-  shot.style.left = Math.min(W - s.tile_w, Math.max(0, X(t) - s.tile_w / 2)) + "px";
+  const tw = Math.round(s.tile_w * SC), th = Math.round(s.tile_h * SC);
+  shot.style.backgroundPosition = `-${col * tw}px -${row * th}px`;
+  shot.style.left = Math.min(W - tw, Math.max(0, X(t) - tw / 2)) + "px";
   shot.style.display = "block";
   hint.style.display = "none";
 }
@@ -485,17 +536,19 @@ new ResizeObserver(draw).observe(root);
 """
 
 
-def volume_chart_html(rms, win_sec, threshold, clips, duration, sprite, c) -> tuple[str, int]:
+def volume_chart_html(rms, win_sec, threshold, clips, duration, sprite, c,
+                      sprite_scale: float = 1.0) -> tuple[str, int]:
     """音量の推移・しきい値・切り出し範囲を描き、ホバーでその瞬間のコマを見せる"""
     times, values = thin_out(rms, win_sec)
     data = {
         "t": times, "v": values, "threshold": threshold,
         "clips": [[round(s, 2), round(e, 2)] for s, e in clips],
         "duration": duration, "plotH": PLOT_H, "sprite": sprite,
+        "spriteScale": sprite_scale,
         "bandOpacity": c["band_opacity"],
         "colors": {k: c[k] for k in ("series", "ink", "muted", "grid", "surface")},
     }
-    height = (sprite["tile_h"] if sprite else 26) + PLOT_H + 8
+    height = (round(sprite["tile_h"] * sprite_scale) if sprite else 26) + PLOT_H + 8
     return CHART_TEMPLATE.replace("__DATA__", json.dumps(data)), height
 
 
@@ -506,7 +559,7 @@ st.title("🎬 盛り上がった瞬間を切り出す")
 st.subheader("① 動画を選ぶ")
 c_path, c_browse = st.columns([7, 1.4], vertical_alignment="bottom")
 
-if c_browse.button("📁 参照", width="stretch"):
+if c_browse.button("📁 参照", key="browse_video", width="stretch"):
     picked = pick_file_dialog()
     if picked:
         st.session_state["video_path"] = picked
@@ -620,12 +673,18 @@ st.caption(
     f"合計 {ac.sec_to_hms(total_clip_sec)}(元動画の {total_clip_sec / total_sec:.0%})"
 )
 
-st.markdown("**音量の推移**")
+c_ttl, c_zoom = st.columns([5, 2], vertical_alignment="bottom")
+c_ttl.markdown("**音量の推移**")
+zoom = c_zoom.selectbox(
+    "サムネイルの大きさ", ["標準", "大", "特大"], index=1,
+    help="カーソルを合わせたときに出るコマ映像の表示サイズ(標準240 / 大360 / 特大480ピクセル)",
+)
 with st.spinner("プレビュー用のコマ画像を用意しています…(この動画では最初の1回だけ)"):
     sprite = load_sprite(str(video.resolve()), video.stat().st_mtime, total_sec)
 st.session_state["sprite_in_use"] = sprite["path"] if sprite else None
 chart_html, chart_h = volume_chart_html(
-    rms, WIN_SEC, threshold, clips, total_sec, sprite, theme()
+    rms, WIN_SEC, threshold, clips, total_sec, sprite, theme(),
+    sprite_scale={"標準": 1.0, "大": 1.5, "特大": 2.0}[zoom],
 )
 st.iframe(chart_html, height=chart_h)
 st.caption(
@@ -649,14 +708,77 @@ st.dataframe(
     hide_index=True,
 )
 
-# ---------------- ④ 書き出す ----------------
-st.subheader("④ 書き出す")
+# ---------------- ④ 中身を確認する ----------------
+st.subheader("④ 中身を確認する")
+st.caption(
+    "書き出す前に、候補をその場で再生して確認できます。"
+    "ここで見えるものは、書き出されるクリップとまったく同じです(確認用は一時ファイルで、保存はされません)。"
+)
+if st.session_state.get("pick_clip", 0) >= len(clips):
+    st.session_state["pick_clip"] = 0
+
+def step_clip(d: int):
+    st.session_state["pick_clip"] = (st.session_state.get("pick_clip", 0) + d) % len(clips)
+
+c_prev, c_pick, c_next = st.columns([1.2, 5, 1.2], vertical_alignment="bottom")
+c_prev.button("◀ 前", key="clip_prev", width="stretch",
+              disabled=len(clips) < 2, on_click=step_clip, args=(-1,))
+c_next.button("次 ▶", key="clip_next", width="stretch",
+              disabled=len(clips) < 2, on_click=step_clip, args=(1,))
+pick = c_pick.selectbox(
+    "確認するクリップ候補", options=range(len(clips)),
+    format_func=lambda k: (
+        f"clip_{k + 1:03d}: {ac.sec_to_hms(clips[k][0])} 〜 {ac.sec_to_hms(clips[k][1])}"
+        f" ({clips[k][1] - clips[k][0]:.0f}秒)"
+    ),
+    key="pick_clip",
+)
+n_tracks = len(tracks) if tracks else 1
+with st.spinner("確認用に切り出しています…"):
+    src = preview_candidate(str(video.resolve()), video.stat().st_mtime,
+                            clips[pick][0], clips[pick][1], n_tracks)
+if src:
+    st.iframe(player_html(src), height=505)
+    if src["extras"]:
+        st.caption(
+            f"この動画は音声が {n_tracks} 本あります。ブラウザは1本しか鳴らせないため、"
+            "残りを重ねて同時に再生しています(音量は変えていません)。"
+        )
+    st.caption(
+        "映像が出ない場合でもクリップは正常です"
+        "(iPhone録画などブラウザが対応しない形式のことがあります)。"
+        "その場合は書き出したあとに QuickTime などで確認してください。"
+    )
+else:
+    st.warning("確認用の切り出しに失敗しました。書き出し自体は試せます。")
+
+# ---------------- ⑤ 書き出す ----------------
+st.subheader("⑤ 書き出す")
+c_out, c_ob = st.columns([6, 1.4], vertical_alignment="bottom")
+if c_ob.button("📁 参照", key="browse_out", width="stretch"):
+    picked_dir = pick_folder_dialog()
+    if picked_dir:
+        st.session_state["out_dir"] = picked_dir
+        st.rerun()
+    else:
+        st.toast("フォルダが選ばれませんでした")
+out_str = c_out.text_input(
+    "書き出し先フォルダ",
+    value=st.session_state.get("out_dir", str(OUT_DIR.resolve())),
+    help="クリップ動画の保存先です。再生確認用の作業ファイルはここには作られません",
+)
+out_dir = Path(out_str.strip().strip('"')).expanduser()
+
 if st.button(f"{len(clips)} 本のクリップを書き出す", type="primary"):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        st.error(f"書き出し先フォルダを作れませんでした: {e}")
+        st.stop()
     bar = st.progress(0.0, text="準備中…")
     written = []
     for i, (s, e) in enumerate(clips, 1):
-        out = OUT_DIR / f"clip_{i:03d}_{ac.sec_to_hms(s).replace(':', '')}.mp4"
+        out = out_dir / f"clip_{i:03d}_{ac.sec_to_hms(s).replace(':', '')}.mp4"
         bar.progress((i - 1) / len(clips), text=f"{out.name} を書き出し中…({i}/{len(clips)})")
         ac.ffmpeg("-ss", f"{s:.1f}", "-i", video, "-t", f"{e - s:.1f}",
                   *ac.CUT_MAP, "-c", "copy", out)
@@ -666,32 +788,11 @@ if st.button(f"{len(clips)} 本のクリップを書き出す", type="primary"):
 
 written = [p for p in st.session_state.get("written", []) if Path(p).is_file()]
 if written:
-    st.success(f"{OUT_DIR}/ に {len(written)} 本のクリップがあります")
+    written_dir = Path(written[0]).parent
+    st.success(f"{written_dir}/ に {len(written)} 本のクリップがあります")
     if st.button("📂 フォルダを開く"):
         opener = "explorer" if sys.platform.startswith("win") else "open"
-        subprocess.run([opener, str(OUT_DIR.resolve())])
-
-    st.subheader("⑤ 中身を確認する")
-    pick = st.selectbox(
-        "確認するクリップ", options=range(len(written)),
-        format_func=lambda k: Path(written[k]).name,
-    )
-    n_tracks = len(tracks) if tracks else 1
-    with st.spinner("再生の準備をしています…"):
-        src = preview_sources(written[pick], Path(written[pick]).stat().st_mtime, n_tracks)
-    st.iframe(player_html(src), height=460)
-
-    if src["extras"]:
-        st.caption(
-            f"この動画は音声が {n_tracks} 本あります。ブラウザは1本しか鳴らせないため、"
-            "残りを重ねて同時に再生しています(音量は変えていません)。"
-            "書き出したクリップ自体は元動画と同じ構成のままです。"
-        )
-    st.caption(
-        "映像が出ない場合でもファイルは正常です"
-        "(iPhone録画などブラウザが対応しない形式のことがあります)。"
-        "その場合は「📂 フォルダを開く」から QuickTime などで確認してください。"
-    )
+        subprocess.run([opener, str(written_dir.resolve())])
 
 st.divider()
 render_cache_panel(video)
