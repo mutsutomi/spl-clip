@@ -12,12 +12,12 @@ auto_clip.py のブラウザ操作版。
 
 from __future__ import annotations  # 古いPythonでも読み込めるようにする(エラーを分かりやすく)
 
-import base64
 import json
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import streamlit as st
@@ -28,6 +28,7 @@ VIDEO_EXTS = [".mov", ".mp4", ".mkv", ".avi", ".m4v"]
 WIN_SEC = ac.CONFIG["win_sec"]
 OUT_DIR = Path(ac.CONFIG["out_dir"])
 CACHE_DIR = Path(ac.CONFIG["cache_dir"])
+STATIC_DIR = Path("static")  # ブラウザに直接読ませるサムネイル画像の置き場所
 MAX_POINTS = 1500  # グラフに描く点の上限(これを超えたら間引く)
 PLOT_H = 240       # グラフ本体の高さ(px)
 
@@ -86,14 +87,18 @@ def default_video() -> str:
     return str(max(found, key=lambda p: p.stat().st_mtime).resolve())
 
 
-def ensure_audio(video: Path, track: int) -> Path:
-    """検出用WAVを用意する。トラックを変えたときだけ自動で取り込み直す"""
+def ensure_audio(video: Path, track: int, force: bool = False) -> Path:
+    """検出用WAVを用意する。トラックを変えたときだけ自動で取り込み直す。
+
+    force は「使う音声を選び直した直後」だけ真になる。WAVの名前にトラック番号は
+    入っていないため、既存ファイルが選んだトラックのものだと確認できないときに使う。
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     wav = ac.cache_wav_path(video, CACHE_DIR)
     key = (str(video.resolve()), track)
 
     # 既にあるWAVがどのトラックのものか分からない初回は、そのまま信用して使う
-    stale = st.session_state.get("audio_key") not in (None, key)
+    stale = force or st.session_state.get("audio_key") not in (None, key)
     if stale or not wav.exists():
         with st.spinner("音声を取り込んでいます…(長い動画では数分かかります)"):
             ac.extract_audio(video, wav, track, refresh=True)
@@ -135,12 +140,17 @@ def delete_cache(paths: list[Path]):
 def render_cache_panel(current_video: Path | None = None):
     """溜まった作業ファイルの量を見せて、その場で削除できるようにする"""
     files = sorted(
-        (p for p in CACHE_DIR.iterdir() if p.suffix in (".wav", ".jpg")),
+        (p for d in (CACHE_DIR, STATIC_DIR) if d.exists()
+         for p in d.iterdir() if p.suffix in (".wav", ".jpg")),
         key=lambda p: p.stat().st_mtime, reverse=True,
-    ) if CACHE_DIR.exists() else []
+    )
     total = sum(p.stat().st_size for p in files)
-    in_use = {ac.cache_wav_path(current_video, CACHE_DIR),
-              ac.sprite_path(current_video, CACHE_DIR)} if current_video else set()
+    in_use = set()
+    if current_video:
+        in_use = {ac.cache_wav_path(current_video, CACHE_DIR)}
+        sprite = st.session_state.get("sprite_in_use")
+        if sprite:
+            in_use.add(Path(sprite))
 
     with st.expander(f"🗂 作業ファイル(キャッシュ) — {len(files)} 個 / 合計 {fmt_size(total)}"):
         st.caption(
@@ -185,29 +195,39 @@ def render_cache_panel(current_video: Path | None = None):
 
 
 def thin_out(rms: np.ndarray, win_sec: float) -> tuple[list, list]:
-    """描画用に点を間引く。区間の最大値を残すので、山(ピーク)は消えない"""
-    idx = np.arange(len(rms))
-    if len(rms) > MAX_POINTS:
+    """描画用に点を間引く。区間の最大値を残すので、山(ピーク)は消えない。
+
+    時刻は必ず等間隔にする。画面側はカーソル位置から点を逆算するので、
+    間隔がばらつくと読み取る時刻がずれてしまう。
+    """
+    if len(rms) <= MAX_POINTS:
+        times, values = np.arange(len(rms)) * win_sec, rms
+    else:
         k = int(np.ceil(len(rms) / MAX_POINTS))
         n = len(rms) // k
-        block = rms[: n * k].reshape(n, k)
-        idx = block.argmax(axis=1) + np.arange(n) * k
-    return (idx * win_sec).round(2).tolist(), rms[idx].round(1).tolist()
+        values = rms[: n * k].reshape(n, k).max(axis=1)
+        times = np.arange(n) * k * win_sec
+    return times.round(2).tolist(), values.round(1).tolist()
 
 
 @st.cache_data(show_spinner=False)
 def load_sprite(video_path: str, mtime: float, duration: float):
-    """プレビュー用サムネイルを用意する。作れなかった場合は None(グラフは出る)"""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    """プレビュー用サムネイルを用意する。作れなかった場合は None(グラフは出る)。
+
+    画像は data URI で埋め込まず、Streamlit の静的配信(static/)経由で読ませる。
+    長い動画では十数MBになるため、画面を更新するたびに送り直すと重すぎるため。
+    """
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
     video = Path(video_path)
-    out = ac.sprite_path(video, CACHE_DIR)
+    out = ac.sprite_path(video, STATIC_DIR, ac.sprite_interval(duration))
     if not out.exists() and ac.make_sprite(video, out, duration) is None:
         return None
     size = ac.probe_size(out)
     if size is None:
         return None
     meta = ac.sprite_meta(duration, size)
-    meta["uri"] = "data:image/jpeg;base64," + base64.b64encode(out.read_bytes()).decode()
+    meta["url"] = f"app/static/{quote(out.name)}?v={int(out.stat().st_mtime)}"
+    meta["path"] = str(out)
     return meta
 
 
@@ -251,7 +271,7 @@ band.style.height = (D.sprite ? bandH : 26) + "px";
 if (D.sprite) {
   shot.style.width = D.sprite.tile_w + "px";
   shot.style.height = D.sprite.tile_h + "px";
-  shot.style.backgroundImage = "url(" + D.sprite.uri + ")";
+  shot.style.backgroundImage = "url(" + D.sprite.url + ")";
   hint.textContent = "グラフにカーソルを合わせると、その瞬間の映像が出ます";
 } else {
   hint.textContent = "";
@@ -425,15 +445,30 @@ elif len(tracks) == 1:
         "選ぶ必要はありません。"
     )
 else:
-    track = st.selectbox(
+    # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
+    # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
+    choice = st.selectbox(
         f"どの音声で判定しますか?(この動画には {len(tracks)} 本あります)",
         options=range(len(tracks)),
         format_func=lambda i: ac.describe_track(i, tracks[i]),
         help="OBSなどで音を分けて録画した場合、マイクだけのトラックを選ぶと"
              "ゲーム音に埋もれずに自分の声で検出できます",
     )
+    decided = (str(video.resolve()), int(choice))
+    if st.session_state.get("track_decided") != decided:
+        if st.button("この音声で解析する", type="primary"):
+            st.session_state["track_decided"] = decided
+            st.session_state["force_extract"] = True
+            st.rerun()
+        st.info(
+            "使う音声を選んでから「この音声で解析する」を押してください。"
+            "取り込みには少し時間がかかるので、選び終わってから始めます。"
+        )
+        render_cache_panel(video)
+        st.stop()
+    track = choice
 
-wav = ensure_audio(video, int(track))
+wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
 rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
 total_sec = len(rms) * WIN_SEC
 st.caption(f"長さ {ac.sec_to_hms(total_sec)} / 音声トラック {int(track)} を解析対象にしています")
@@ -472,6 +507,7 @@ st.caption(
 st.markdown("**音量の推移**")
 with st.spinner("プレビュー用のコマ画像を用意しています…(この動画では最初の1回だけ)"):
     sprite = load_sprite(str(video.resolve()), video.stat().st_mtime, total_sec)
+st.session_state["sprite_in_use"] = sprite["path"] if sprite else None
 chart_html, chart_h = volume_chart_html(
     rms, WIN_SEC, threshold, clips, total_sec, sprite, theme()
 )

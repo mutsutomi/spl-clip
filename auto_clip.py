@@ -93,9 +93,12 @@ def cache_wav_path(video: Path, cache_dir: Path) -> Path:
     return cache_path(video, cache_dir, "audio", "wav")
 
 
-def sprite_path(video: Path, cache_dir: Path) -> Path:
-    """プレビュー用サムネイル(コマ画像を1枚にまとめたもの)のパス"""
-    return cache_path(video, cache_dir, "sprite", "jpg")
+def sprite_path(video: Path, cache_dir: Path, interval: float) -> Path:
+    """プレビュー用サムネイル(コマ画像を1枚にまとめたもの)のパス。
+
+    間隔を名前に含めるので、間隔が変わったときは自動的に別ファイルとして作り直される。
+    """
+    return cache_path(video, cache_dir, f"sprite{int(interval)}s", "jpg")
 
 
 def probe_size(image: Path) -> tuple[int, int] | None:
@@ -110,17 +113,24 @@ def probe_size(image: Path) -> tuple[int, int] | None:
         return None
 
 
-SPRITE_INTERVAL = 5.0  # 何秒ごとにコマを取るか
-SPRITE_WIDTH = 160     # コマ1枚の横幅(px)
-SPRITE_COLS = 12       # 横に並べる枚数
+SPRITE_INTERVAL = 5.0    # 何秒ごとにコマを取るか(短めの動画のとき)
+SPRITE_WIDTH = 160       # コマ1枚の横幅(px)
+SPRITE_COLS = 12         # 横に並べる枚数
+SPRITE_MAX_TILES = 1000  # コマ数の上限。長い動画で画像が巨大になりブラウザが描けなくなるのを防ぐ
+
+
+def sprite_interval(duration: float) -> float:
+    """コマの間隔。長い動画では間隔を広げて、画像が大きくなりすぎないようにする"""
+    return float(max(SPRITE_INTERVAL, math.ceil(duration / SPRITE_MAX_TILES)))
 
 
 def sprite_meta(duration: float, size: tuple[int, int]) -> dict:
     """サムネイル画像のタイル構成。生成時と読み込み時で同じ計算をする"""
-    count = max(1, math.ceil(duration / SPRITE_INTERVAL))
+    interval = sprite_interval(duration)
+    count = max(1, math.ceil(duration / interval))
     rows = math.ceil(count / SPRITE_COLS)
     return {
-        "cols": SPRITE_COLS, "rows": rows, "count": count, "interval": SPRITE_INTERVAL,
+        "cols": SPRITE_COLS, "rows": rows, "count": count, "interval": interval,
         "tile_w": size[0] // SPRITE_COLS, "tile_h": size[1] // rows,
     }
 
@@ -133,7 +143,7 @@ def make_sprite(video: Path, out: Path, duration: float) -> dict | None:
     meta = sprite_meta(duration, (0, 0))
     try:
         ffmpeg("-skip_frame", "nokey", "-i", video,
-               "-vf", f"fps=1/{SPRITE_INTERVAL},scale={SPRITE_WIDTH}:-1,"
+               "-vf", f"fps=1/{meta['interval']},scale={SPRITE_WIDTH}:-1,"
                       f"tile={SPRITE_COLS}x{meta['rows']}",
                "-frames:v", 1, "-q:v", 7, out)
     except (OSError, subprocess.CalledProcessError):
