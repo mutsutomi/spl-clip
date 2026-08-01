@@ -15,7 +15,8 @@ venv\Scripts\streamlit.exe run app.py
 goto end
 
 :nosetup
-echo セットアップがまだのようです。README の「準備」を先に実行してください。
+echo まだ準備ができていません。
+echo 同じフォルダにある「準備.bat」を先にダブルクリックしてください。
 echo.
 pause
 

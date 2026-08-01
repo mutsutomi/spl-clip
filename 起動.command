@@ -3,8 +3,9 @@
 cd "$(dirname "$0")" || exit 1
 
 if [ ! -x venv/bin/streamlit ]; then
-  echo "セットアップがまだのようです。README の「準備」を先に実行してください。"
-  echo "(このウィンドウは閉じて構いません)"
+  echo "まだ準備ができていません。"
+  echo "同じフォルダにある「準備.command」を先にダブルクリックしてください。"
+  echo
   read -r -p "Enterキーで閉じます..."
   exit 1
 fi

@@ -12,6 +12,8 @@
 依存: ffmpeg, numpy
 """
 
+from __future__ import annotations  # 古いPythonでも読み込めるようにする(エラーを分かりやすく)
+
 import argparse
 import hashlib
 import json
@@ -38,6 +40,15 @@ CONFIG = {
 # ====================================================================================
 
 
+BIN_DIR = Path(__file__).resolve().parent / "bin"
+
+
+def tool(name: str) -> str:
+    """準備スクリプトが bin/ に置いた実行ファイルを優先し、無ければPATH上のものを使う"""
+    exe = BIN_DIR / (f"{name}.exe" if sys.platform.startswith("win") else name)
+    return str(exe) if exe.exists() else name
+
+
 def sec_to_hms(t: float) -> str:
     h, rem = divmod(int(t), 3600)
     m, s = divmod(rem, 60)
@@ -45,14 +56,14 @@ def sec_to_hms(t: float) -> str:
 
 
 def ffmpeg(*args):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *map(str, args)]
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", *map(str, args)]
     subprocess.run(cmd, check=True)
 
 
 def audio_tracks(video: Path) -> list[dict] | None:
     """動画に入っている音声トラックの一覧。調べられなかった場合は None"""
     cmd = [
-        "ffprobe", "-hide_banner", "-loglevel", "error", "-select_streams", "a",
+        tool("ffprobe"), "-hide_banner", "-loglevel", "error", "-select_streams", "a",
         "-show_entries", "stream=codec_name,channels:stream_tags=title",
         "-of", "json", str(video),
     ]
@@ -89,7 +100,7 @@ def sprite_path(video: Path, cache_dir: Path) -> Path:
 
 def probe_size(image: Path) -> tuple[int, int] | None:
     """画像の縦横サイズ"""
-    cmd = ["ffprobe", "-hide_banner", "-loglevel", "error", "-select_streams", "v",
+    cmd = [tool("ffprobe"), "-hide_banner", "-loglevel", "error", "-select_streams", "v",
            "-show_entries", "stream=width,height", "-of", "json", str(image)]
     try:
         s = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
@@ -197,8 +208,8 @@ def main():
     ap.add_argument("--refresh-audio", action="store_true", help="抽出済みWAVを使わず作り直す")
     args = ap.parse_args()
 
-    if shutil.which("ffmpeg") is None:
-        sys.exit("ffmpeg が見つかりません。brew install ffmpeg でインストールしてください")
+    if shutil.which(tool("ffmpeg")) is None:
+        sys.exit("ffmpeg が見つかりません。準備.command(Windowsは準備.bat)を実行してください")
     if not args.video.exists():
         sys.exit(f"動画ファイルが見つかりません: {args.video}")
 

@@ -10,6 +10,8 @@ auto_clip.py のブラウザ操作版。
 検出ロジックは auto_clip.py をそのまま呼んでいるので、コマンド版と結果は同じになる。
 """
 
+from __future__ import annotations  # 古いPythonでも読み込めるようにする(エラーを分かりやすく)
+
 import base64
 import json
 import subprocess

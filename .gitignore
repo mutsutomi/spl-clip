@@ -15,5 +15,8 @@ venv/
 clips/
 cache/
 
+# 準備スクリプトが取得するffmpeg(125MBほどある)
+bin/
+
 # macOS
 .DS_Store
