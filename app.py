@@ -116,6 +116,29 @@ def load_tracks(video_path: str, mtime: float):
 
 
 @st.cache_data(show_spinner=False)
+def load_track_info(video_path: str, mtime: float, n_tracks: int):
+    """各トラックの素性を調べ、試聴用の短い音声も用意する"""
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    video = Path(video_path)
+    duration = ac.probe_duration(video) or 0.0
+    tag = hashlib.sha1(f"{video.resolve()}:{mtime}".encode()).hexdigest()[:8]
+
+    info = []
+    for i in range(n_tracks):
+        sample = STATIC_DIR / f"samp_{tag}_a{i}.m4a"
+        if not sample.exists():
+            try:
+                ac.extract_track_sample(video, sample, i, max(0.0, duration * 0.5 - 10))
+            except (OSError, subprocess.CalledProcessError):
+                pass
+        info.append({
+            "profile": ac.track_profile(video, i, duration),
+            "sample": str(sample) if sample.exists() else None,
+        })
+    return info
+
+
+@st.cache_data(show_spinner=False)
 def load_rms(wav_path: str, mtime: float, win_sec: float):
     """音量の解析結果をキャッシュする。スライダー操作のたびに再計算しないための要"""
     return ac.compute_rms(Path(wav_path), win_sec)
@@ -529,13 +552,24 @@ elif len(tracks) == 1:
 else:
     # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
     # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
-    choice = st.selectbox(
+    with st.spinner("それぞれの音声がどんな音か調べています…"):
+        info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
+
+    choice = st.radio(
         f"どの音声で判定しますか?(この動画には {len(tracks)} 本あります)",
         options=range(len(tracks)),
-        format_func=lambda i: ac.describe_track(i, tracks[i]),
+        format_func=lambda i: ac.describe_track(i, tracks[i], info[i]["profile"]),
         help="OBSなどで音を分けて録画した場合、マイクだけのトラックを選ぶと"
              "ゲーム音に埋もれずに自分の声で検出できます",
     )
+    st.caption("迷ったら聞いてみてください(動画の中ほどから15秒)")
+    for i in range(len(tracks)):
+        c1, c2 = st.columns([1, 6], vertical_alignment="center")
+        c1.markdown(f"トラック {i}")
+        if info[i]["sample"]:
+            c2.audio(info[i]["sample"])
+        else:
+            c2.caption("試聴を用意できませんでした")
     decided = (str(video.resolve()), int(choice))
     if st.session_state.get("track_decided") != decided:
         if st.button("この音声で解析する", type="primary"):

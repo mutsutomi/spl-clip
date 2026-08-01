@@ -79,12 +79,98 @@ def audio_tracks(video: Path) -> list[dict] | None:
         return None
 
 
-def describe_track(i: int, stream: dict) -> str:
-    """「トラック 1: モノラル(マイク)」のような説明文をつくる"""
+def probe_duration(video: Path) -> float | None:
+    """動画の長さ(秒)"""
+    cmd = [tool("ffprobe"), "-hide_banner", "-loglevel", "error",
+           "-show_entries", "format=duration", "-of", "json", str(video)]
+    try:
+        d = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
+        return float(d["format"]["duration"])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
+def track_pcm(video: Path, track: int, at_sec: float, dur: float, sr: int = 16000):
+    """指定トラックの一部を2chのPCMとして読み込む(中間ファイルを作らない)"""
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(at_sec),
+           "-i", str(video), "-map", f"0:a:{track}", "-t", str(dur), "-vn",
+           "-ac", "2", "-ar", str(sr), "-f", "s16le", "-"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if len(raw) < 4000:
+        return None
+    return np.frombuffer(raw[: len(raw) // 4 * 4], dtype=np.int16).astype(np.float32).reshape(-1, 2)
+
+
+def track_profile(video: Path, track: int, duration: float, dur: float = 15.0) -> dict | None:
+    """音声トラックの素性を測る。
+
+    左右が完全に同じ波形かどうか(1本の音源か)が一番あてになる手がかりで、
+    喋っていない場面でも変わらない。無音の割合は場面によって振れるので、
+    動画の3箇所を測って平均する。
+    """
+    spots = [duration * f for f in (0.25, 0.5, 0.75)]
+    lrs, quiets, levels = [], [], []
+    for at in spots:
+        d = track_pcm(video, track, max(0.0, at - dur / 2), dur)
+        if d is None:
+            continue
+        L, R = d[:, 0], d[:, 1]
+        mono = L + R
+        if np.abs(mono).max() < 1:
+            quiets.append(1.0)
+            continue
+        win = 1600
+        n = max(1, len(mono) // win)
+        rms = np.sqrt((mono[: n * win].reshape(n, win) ** 2).mean(axis=1))
+        lr = 1.0 if np.array_equal(L, R) else float(np.corrcoef(L, R)[0, 1])
+        lrs.append(0.0 if np.isnan(lr) else lr)
+        quiets.append(float((rms < max(rms.max() * 0.05, 1.0)).mean()))
+        levels.append(float(20 * np.log10(max(np.sqrt((mono ** 2).mean()), 1.0) / 32768)))
+
+    if not quiets:
+        return None
+    if not lrs:
+        return {"silent": True}
+    return {
+        "silent": False,
+        "lr": min(lrs),                      # 1箇所でも広がりがあればステレオ音源
+        "quiet": sum(quiets) / len(quiets),
+        "dbfs": max(levels),
+    }
+
+
+def extract_track_sample(video: Path, out: Path, track: int, at_sec: float, dur: float = 15.0):
+    """試聴用の短い音声。ブラウザで鳴らすのでAACに変換する(15秒なので一瞬)"""
+    ffmpeg("-ss", at_sec, "-i", video, "-map", f"0:a:{track}", "-t", dur, "-vn",
+           "-c:a", "aac", "-b:a", 128_000, out)
+
+
+def describe_track(i: int, stream: dict, profile: dict | None = None) -> str:
+    """「トラック 1: モノラル音源・無音が多い → マイクの可能性」のような説明文をつくる"""
     ch = {1: "モノラル", 2: "ステレオ"}.get(stream.get("channels"), f"{stream.get('channels', '?')}ch")
+    parts = [ch]
     title = (stream.get("tags") or {}).get("title")
-    name = f"トラック {i}: {ch}"
-    return f"{name}({title})" if title else name
+    if title:
+        parts.append(title)
+
+    guess = None
+    if profile and not profile.get("silent"):
+        mono_src = profile["lr"] > 0.999
+        parts.append("左右が同じ(音源1本)" if mono_src else "左右に広がりあり")
+        if profile["quiet"] > 0.35:
+            parts.append("音が途切れる")
+            if mono_src:
+                guess = "マイクの可能性"
+        elif profile["quiet"] < 0.10:
+            parts.append("鳴りっぱなし")
+    elif profile and profile.get("silent"):
+        parts.append("ほぼ無音")
+
+    name = f"トラック {i}: " + "・".join(parts)
+    return f"{name} → {guess}" if guess else name
 
 
 def cache_path(video: Path, cache_dir: Path, kind: str, ext: str) -> Path:
