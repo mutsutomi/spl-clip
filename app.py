@@ -608,34 +608,35 @@ else:
     with st.spinner("それぞれの音声がどんな音か調べています…"):
         info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
 
-    choice = st.radio(
-        f"どの音声で判定しますか?(この動画には {len(tracks)} 本あります)",
-        options=range(len(tracks)),
-        format_func=lambda i: ac.describe_track(i, tracks[i], info[i]["profile"]),
-        help="OBSなどで音を分けて録画した場合、マイクだけのトラックを選ぶと"
-             "ゲーム音に埋もれずに自分の声で検出できます",
+    st.markdown(f"**どの音声で判定しますか?(この動画には {len(tracks)} 本あります)**")
+    st.caption(
+        "試聴は動画の中ほどから15秒です。OBSなどで音を分けて録画した場合、"
+        "マイクだけのトラックを選ぶとゲーム音に埋もれずに自分の声で検出できます。"
     )
-    st.caption("迷ったら聞いてみてください(動画の中ほどから15秒)")
+    sel = st.session_state.get("track_decided")
+    current = sel[1] if sel and sel[0] == str(video.resolve()) else None
     for i in range(len(tracks)):
-        c1, c2 = st.columns([1, 6], vertical_alignment="center")
-        c1.markdown(f"トラック {i}")
+        c_lbl, c_au, c_btn = st.columns([4, 3, 1.6], vertical_alignment="center")
+        mark = "✅ " if i == current else ""
+        c_lbl.markdown(mark + ac.describe_track(i, tracks[i], info[i]["profile"]))
         if info[i]["sample"]:
-            c2.audio(info[i]["sample"])
+            c_au.audio(info[i]["sample"])
         else:
-            c2.caption("試聴を用意できませんでした")
-    decided = (str(video.resolve()), int(choice))
-    if st.session_state.get("track_decided") != decided:
-        if st.button("この音声で解析する", type="primary"):
-            st.session_state["track_decided"] = decided
+            c_au.caption("試聴を用意できませんでした")
+        if i == current:
+            c_btn.button("使用中", key=f"pick_track_{i}", disabled=True, width="stretch")
+        elif c_btn.button("この音声で解析", key=f"pick_track_{i}", type="primary", width="stretch"):
+            st.session_state["track_decided"] = (str(video.resolve()), i)
             st.session_state["force_extract"] = True
             st.rerun()
+    if current is None:
         st.info(
-            "使う音声を選んでから「この音声で解析する」を押してください。"
-            "取り込みには少し時間がかかるので、選び終わってから始めます。"
+            "それぞれ試聴して、判定に使いたい音声の「この音声で解析」を押してください。"
+            "音声の取り込みには少し時間がかかるので、選んでから始めます。"
         )
         render_cache_panel(video)
         st.stop()
-    track = choice
+    track = current
 
 wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
 rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
@@ -714,11 +715,17 @@ st.caption(
     "書き出す前に、候補をその場で再生して確認できます。"
     "ここで見えるものは、書き出されるクリップとまったく同じです(確認用は一時ファイルで、保存はされません)。"
 )
-if st.session_state.get("pick_clip", 0) >= len(clips):
+# 選択欄の状態はブラウザから文字列で返ってくることがある(候補のラベルが
+# スライダー変更で変わった直後など)ので、整数の範囲内であることを常に確かめる
+_pick = st.session_state.get("pick_clip", 0)
+if not isinstance(_pick, int) or not (0 <= _pick < len(clips)):
     st.session_state["pick_clip"] = 0
 
 def step_clip(d: int):
-    st.session_state["pick_clip"] = (st.session_state.get("pick_clip", 0) + d) % len(clips)
+    cur = st.session_state.get("pick_clip", 0)
+    if not isinstance(cur, int):
+        cur = 0
+    st.session_state["pick_clip"] = (cur + d) % len(clips)
 
 c_prev, c_pick, c_next = st.columns([1.2, 5, 1.2], vertical_alignment="bottom")
 c_prev.button("◀ 前", key="clip_prev", width="stretch",
