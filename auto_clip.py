@@ -25,6 +25,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 # ============ 設定(ここを書き換えてもいいし、コマンドライン引数で上書きも可) ============
 CONFIG = {
@@ -259,6 +260,112 @@ def mix_preview(clip: Path, out: Path, n_tracks: int):
            "-c:v", "copy", "-c:a", "aac", "-b:a", 192_000, out)
 
 
+# ============ キル表示(「をたおした!」)の検出 ============
+# スプラトゥーン3では、敵をたおすと画面下端の決まった位置に「◯◯をたおした!」が出る。
+# その帯を1秒ごとに切り出し、同梱のお手本画像と照合して一致した時刻を「キルの瞬間」とする。
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+KILL_TEMPLATE = ASSETS_DIR / "taoshita_1080p.png"
+KILL_BAND = (600, 960, 720, 96)   # 1080p基準の帯: x, y, 幅, 高さ(他解像度は高さ比で換算)
+KILL_SCAN_W, KILL_SCAN_H = 240, 32   # 照合は縮小して行う(精度は実測で確認済み)
+KILL_TMPL_W, KILL_TMPL_H = 60, 14
+KILL_THRESHOLD = 0.8   # 一致度のしきい値。表示中は0.99前後、非表示時は0.6以下(実測)
+
+
+def load_kill_template(path: Path | None = None):
+    """お手本画像を照合用の縮小グレースケールとして読み込む"""
+    p = Path(path) if path else KILL_TEMPLATE
+    if not p.is_file():
+        return None
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(p),
+           "-vf", f"scale={KILL_TMPL_W}:{KILL_TMPL_H},format=gray", "-f", "rawvideo", "-"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if len(raw) < KILL_TMPL_W * KILL_TMPL_H:
+        return None
+    t = np.frombuffer(raw[: KILL_TMPL_W * KILL_TMPL_H], dtype=np.uint8) \
+        .astype(np.float32).reshape(KILL_TMPL_H, KILL_TMPL_W)
+    return (t - t.mean()) / (t.std() + 1e-6)
+
+
+def _kill_band_frames(video: Path, start: float, dur: float, size: tuple[int, int]):
+    """キル表示が出る帯だけを1秒ごとに切り出す(小さいのでデコード以外のコストはほぼゼロ)"""
+    w, h = size
+    s = h / 1080.0
+    x, y, bw, bh = (round(v * s) for v in KILL_BAND)
+    x = max(0, min(x, w - bw))
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(start),
+           "-i", str(video), "-t", str(dur),
+           "-vf", f"fps=1,crop={bw}:{bh}:{x}:{y},scale={KILL_SCAN_W}:{KILL_SCAN_H},format=gray",
+           "-f", "rawvideo", "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    n = len(raw) // (KILL_SCAN_W * KILL_SCAN_H)
+    return np.frombuffer(raw[: n * KILL_SCAN_W * KILL_SCAN_H], dtype=np.uint8) \
+        .reshape(n, KILL_SCAN_H, KILL_SCAN_W).astype(np.float32)
+
+
+def _match_score(frame, tmpl) -> float:
+    """帯の中でお手本と一番似ている場所の一致度(-1〜1)。名前の長さで表示位置がずれても拾える"""
+    w = sliding_window_view(frame, (KILL_TMPL_H, KILL_TMPL_W))
+    mu = w.mean(axis=(2, 3), keepdims=True)
+    sd = w.std(axis=(2, 3), keepdims=True) + 1e-6
+    ncc = np.einsum("ijkl,kl->ij", (w - mu) / sd, tmpl) / tmpl.size
+    return float(ncc.max())
+
+
+def scan_kills(video: Path, duration: float, template=None,
+               threshold: float = KILL_THRESHOLD, chunk: float = 300.0,
+               on_progress=None) -> list[float] | None:
+    """キル表示が現れた時刻(秒)のリストを返す。走査できない場合は None。
+
+    表示は数秒続くので、連続して一致している間は最初の1秒だけを記録する。
+    """
+    tmpl = template if isinstance(template, np.ndarray) else load_kill_template(template)
+    size = probe_size(video)
+    if tmpl is None or size is None:
+        return None
+
+    events: list[float] = []
+    prev_hit = False
+    t0 = 0.0
+    while t0 < duration:
+        d = min(chunk, duration - t0)
+        for i, f in enumerate(_kill_band_frames(video, t0, d, size)):
+            hit = _match_score(f, tmpl) >= threshold
+            if hit and not prev_hit:
+                events.append(t0 + i)
+            prev_hit = hit
+        t0 += chunk
+        if on_progress:
+            on_progress(min(1.0, t0 / duration))
+    return events
+
+
+def kills_cache_path(video: Path, cache_dir: Path) -> Path:
+    """キル走査の結果キャッシュ(JSON)のパス"""
+    return cache_path(video, cache_dir, "kills", "json")
+
+
+def scan_kills_cached(video: Path, cache_dir: Path, duration: float,
+                      on_progress=None, refresh: bool = False) -> list[float] | None:
+    """キル走査の結果をキャッシュ付きで返す。走査は動画1時間あたり3〜4分かかるため"""
+    p = kills_cache_path(video, cache_dir)
+    if p.exists() and not refresh:
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d.get("times"), list):
+                return [float(t) for t in d["times"]]
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass  # 壊れたキャッシュは作り直す
+    times = scan_kills(video, duration, on_progress=on_progress)
+    if times is None:
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"times": times}), encoding="utf-8")
+    return times
+
+
 def extract_track_audio(clip: Path, out: Path, track: int):
     """指定した音声トラックだけを、再エンコードせずに取り出す。
 
@@ -330,6 +437,8 @@ def main():
     ap.add_argument("--track", type=int, default=CONFIG["audio_track"], help="音声トラック番号(0始まり)")
     ap.add_argument("--out-dir", type=Path, default=Path(CONFIG["out_dir"]), help="クリップの出力先フォルダ")
     ap.add_argument("--cache-dir", type=Path, default=Path(CONFIG["cache_dir"]), help="作業ファイル(抽出WAV)の置き場所")
+    ap.add_argument("--detect", choices=["audio", "kill", "both"], default="audio",
+                    help="探し方: audio=音量 / kill=キル表示(スプラトゥーン3) / both=両方")
     ap.add_argument("--dry-run", action="store_true", help="切り出しは行わず、候補の一覧表示のみ")
     ap.add_argument("--refresh-audio", action="store_true", help="抽出済みWAVを使わず作り直す")
     args = ap.parse_args()
@@ -350,14 +459,28 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 音声抽出(キャッシュあり)
-    wav = cache_wav_path(args.video, args.cache_dir)
-    extract_audio(args.video, wav, args.track, args.refresh_audio)
-
-    # 2) 音量ピーク検出
-    times = detect_peaks(wav, CONFIG["win_sec"], args.percentile)
+    # 1) 検出(音量 / キル表示 / 両方)
+    times = []
+    if args.detect in ("audio", "both"):
+        wav = cache_wav_path(args.video, args.cache_dir)
+        extract_audio(args.video, wav, args.track, args.refresh_audio)
+        times += detect_peaks(wav, CONFIG["win_sec"], args.percentile)
+    if args.detect in ("kill", "both"):
+        dur = probe_duration(args.video)
+        if dur is None:
+            sys.exit("動画の長さを取得できませんでした")
+        print("[kill] キル表示を走査中...(初回のみ。動画1時間あたり3〜4分)")
+        kills = scan_kills_cached(
+            args.video, args.cache_dir, dur,
+            on_progress=lambda p: print(f"\r[kill] {p:4.0%}", end="", flush=True),
+        )
+        print()
+        if kills is None:
+            sys.exit("キル表示を走査できませんでした(assets/taoshita_1080p.png はありますか?)")
+        print(f"[kill] キル表示: {len(kills)}箇所")
+        times += kills
     if not times:
-        sys.exit("ピークが検出されませんでした。--percentile を下げて(例: 99)再実行してみてください")
+        sys.exit("何も検出されませんでした。--percentile を下げるか、--detect を変えて再実行してみてください")
 
     # 3) 区間の統合
     clips = merge_intervals(times, args.before, args.after, args.gap)

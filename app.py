@@ -33,14 +33,15 @@ STATIC_DIR = Path("static")  # ブラウザに直接読ませるサムネイル�
 MAX_POINTS = 1500  # グラフに描く点の上限(これを超えたら間引く)
 PLOT_H = 240       # グラフ本体の高さ(px)
 
-# 検証済みパレット(dataviz)。Streamlit の実際の背景色に対して検査済み
+# 検証済みパレット(dataviz)。Streamlit の実際の背景色に対して検査済み。
+# kill はカテゴリ2色目(音量の青と隣接ペアで検証済みの橙)
 THEMES = {
     "light": {
-        "series": "#2a78d6", "ink": "#52514e", "muted": "#898781",
+        "series": "#2a78d6", "kill": "#eb6834", "ink": "#52514e", "muted": "#898781",
         "grid": "#e1e0d9", "surface": "#ffffff", "band_opacity": 0.10,
     },
     "dark": {
-        "series": "#3987e5", "ink": "#c3c2b7", "muted": "#898781",
+        "series": "#3987e5", "kill": "#d95926", "ink": "#c3c2b7", "muted": "#898781",
         "grid": "#2c2c2a", "surface": "#0e1117", "band_opacity": 0.18,
     },
 }
@@ -56,6 +57,8 @@ SETTING_DEFAULTS = {
     "gap": int(ac.CONFIG["merge_gap_sec"]),
     "zoom": "大",
     "out_dir": str(OUT_DIR.resolve()),
+    "use_audio": True,
+    "use_kill": False,
 }
 
 
@@ -85,6 +88,9 @@ def load_settings() -> dict:
     v = raw.get("out_dir")
     if isinstance(v, str) and v.strip():
         s["out_dir"] = v
+    for key in ("use_audio", "use_kill"):
+        if isinstance(raw.get(key), bool):
+            s[key] = raw[key]
     return s
 
 
@@ -104,6 +110,9 @@ def current_settings(prev: dict) -> dict:
     v = ss.get("out_dir_input")
     if isinstance(v, str) and v.strip():
         s["out_dir"] = str(Path(v.strip().strip('"')).expanduser())
+    for key in ("use_audio", "use_kill"):
+        if isinstance(ss.get(f"set_{key}"), bool):
+            s[key] = ss[f"set_{key}"]
     return s
 
 
@@ -225,6 +234,21 @@ def load_track_info(video_path: str, mtime: float, n_tracks: int):
     return info
 
 
+def load_kills(video: Path, duration: float):
+    """キル表示の時刻一覧。初回だけ走査し、結果はファイルにキャッシュされる"""
+    bar = None
+    if not ac.kills_cache_path(video, CACHE_DIR).exists():
+        bar = st.progress(0.0, text="キル表示を探しています…(この動画では最初の1回だけ)")
+    times = ac.scan_kills_cached(
+        video, CACHE_DIR, duration,
+        on_progress=(lambda p: bar.progress(p, text=f"キル表示を探しています… {p:.0%}"
+                                                     "(この動画では最初の1回だけ)")) if bar else None,
+    )
+    if bar:
+        bar.empty()
+    return times
+
+
 @st.cache_data(show_spinner=False)
 def load_rms(wav_path: str, mtime: float, win_sec: float):
     """音量の解析結果をキャッシュする。スライダー操作のたびに再計算しないための要"""
@@ -256,7 +280,7 @@ def delete_cache(paths: list[Path]):
 def render_cache_panel(current_video: Path | None = None):
     """溜まった作業ファイルの量を見せて、その場で削除できるようにする"""
     kinds = {".wav": "音声", ".jpg": "コマ画像", ".m4a": "再生用の音声", ".mp4": "再生用の映像",
-             ".mov": "再生用の映像", ".mkv": "再生用の映像"}
+             ".mov": "再生用の映像", ".mkv": "再生用の映像", ".json": "キル検出の結果"}
     files = sorted(
         (p for d in (CACHE_DIR, STATIC_DIR) if d.exists()
          for p in d.iterdir() if p.suffix in kinds),
@@ -275,7 +299,8 @@ def render_cache_panel(current_video: Path | None = None):
         )
     in_use = set()
     if current_video:
-        in_use = {ac.cache_wav_path(current_video, CACHE_DIR)}
+        in_use = {ac.cache_wav_path(current_video, CACHE_DIR),
+                  ac.kills_cache_path(current_video, CACHE_DIR)}
         sprite = st.session_state.get("sprite_in_use")
         if sprite:
             in_use.add(Path(sprite))
@@ -487,7 +512,8 @@ root.style.setProperty("--muted", C.muted);
 
 const PAD = { l: 8, r: 8, t: 10, b: 22 };
 const step = D.t.length > 1 ? D.t[1] - D.t[0] : 1;
-const vmax = Math.max(Math.max.apply(null, D.v), D.threshold) * 1.06 || 1;
+const hasV = D.v.length > 0;
+const vmax = (hasV ? Math.max(Math.max.apply(null, D.v), D.threshold) : 1) * 1.06;
 const SC = D.spriteScale || 1;   // サムネイルの表示倍率(元画像をCSSで拡大する)
 const bandH = D.sprite ? Math.round(D.sprite.tile_h * SC) : 0;
 band.style.height = (D.sprite ? bandH : 26) + "px";
@@ -546,14 +572,25 @@ function draw() {
   }
 
   const ty = Y(D.threshold);
+  const th = D.showThreshold ? `
+    <line x1="${PAD.l}" y1="${ty}" x2="${W - PAD.r}" y2="${ty}"
+          stroke="${C.ink}" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text class="lbl" x="${PAD.l + 6}" y="${ty - 5}" fill="${C.ink}">
+      しきい値 ${Math.round(D.threshold)}</text>` : "";
+
+  // キル表示の時刻(上端の短い縦線)
+  let kmarks = "";
+  (D.kills || []).forEach(kt => {
+    const x = X(kt).toFixed(1);
+    kmarks += `<line x1="${x}" y1="${PAD.t}" x2="${x}" y2="${PAD.t + 14}"
+               stroke="${C.kill}" stroke-width="2" stroke-linecap="round"/>`;
+  });
+
   plot.innerHTML = `<svg width="${W}" height="${H}">
     ${g}${bands}
     <path d="${d}" fill="none" stroke="${C.series}" stroke-width="2"
           stroke-linejoin="round" stroke-linecap="round"/>
-    <line x1="${PAD.l}" y1="${ty}" x2="${W - PAD.r}" y2="${ty}"
-          stroke="${C.ink}" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text class="lbl" x="${PAD.l + 6}" y="${ty - 5}" fill="${C.ink}">
-      しきい値 ${Math.round(D.threshold)}</text>
+    ${th}${kmarks}
     <line id="cross" x1="0" y1="${PAD.t}" x2="0" y2="${PAD.t + innerH}"
           stroke="${C.muted}" stroke-width="1" opacity="0"/>
     <circle id="dot" r="4" fill="${C.series}" stroke="${C.surface}" stroke-width="2" opacity="0"/>
@@ -570,16 +607,18 @@ function onMove(e) {
   const r = plot.getBoundingClientRect();
   const x = e.clientX - r.left;
   const t = Math.min(D.duration, Math.max(0, (x - PAD.l) / innerW * D.duration));
-  const i = Math.min(D.t.length - 1, Math.max(0, Math.round(t / step)));
-
   const cross = document.getElementById("cross");
   const dot = document.getElementById("dot");
   cross.setAttribute("x1", X(t)); cross.setAttribute("x2", X(t));
   cross.setAttribute("opacity", "0.55");
-  dot.setAttribute("cx", X(D.t[i])); dot.setAttribute("cy", Y(D.v[i]));
-  dot.setAttribute("opacity", "1");
-
-  chip.textContent = hms(D.t[i]) + " ・ 音量 " + Math.round(D.v[i]);
+  if (hasV) {
+    const i = Math.min(D.t.length - 1, Math.max(0, Math.round(t / step)));
+    dot.setAttribute("cx", X(D.t[i])); dot.setAttribute("cy", Y(D.v[i]));
+    dot.setAttribute("opacity", "1");
+    chip.textContent = hms(D.t[i]) + " ・ 音量 " + Math.round(D.v[i]);
+  } else {
+    chip.textContent = hms(t);
+  }
   if (!D.sprite) { hint.textContent = chip.textContent; return; }
 
   const s = D.sprite;
@@ -607,16 +646,22 @@ new ResizeObserver(draw).observe(root);
 
 
 def volume_chart_html(rms, win_sec, threshold, clips, duration, sprite, c,
-                      sprite_scale: float = 1.0) -> tuple[str, int]:
-    """音量の推移・しきい値・切り出し範囲を描き、ホバーでその瞬間のコマを見せる"""
-    times, values = thin_out(rms, win_sec)
+                      sprite_scale: float = 1.0, kills=(), show_threshold=True) -> tuple[str, int]:
+    """音量の推移・しきい値・キル表示・切り出し範囲を描き、ホバーでその瞬間のコマを見せる。
+
+    rms が None のとき(キル表示だけで探す場合)は音量の線を描かず、
+    キル印・切り出し範囲・サムネイルだけのグラフになる。
+    """
+    times, values = thin_out(rms, win_sec) if rms is not None else ([], [])
     data = {
         "t": times, "v": values, "threshold": threshold,
         "clips": [[round(s, 2), round(e, 2)] for s, e in clips],
+        "kills": [round(t, 1) for t in kills],
+        "showThreshold": bool(show_threshold),
         "duration": duration, "plotH": PLOT_H, "sprite": sprite,
         "spriteScale": sprite_scale,
         "bandOpacity": c["band_opacity"],
-        "colors": {k: c[k] for k in ("series", "ink", "muted", "grid", "surface")},
+        "colors": {k: c[k] for k in ("series", "kill", "ink", "muted", "grid", "surface")},
     }
     height = (round(sprite["tile_h"] * sprite_scale) if sprite else 26) + PLOT_H + 8
     return CHART_TEMPLATE.replace("__DATA__", json.dumps(data)), height
@@ -631,7 +676,7 @@ st.title("🎬 盛り上がった瞬間を切り出す")
 if "saved_settings" not in st.session_state:
     st.session_state["saved_settings"] = load_settings()
     _s0 = st.session_state["saved_settings"]
-    for _k in ("percentile", "before", "after", "gap", "zoom"):
+    for _k in ("percentile", "before", "after", "gap", "zoom", "use_audio", "use_kill"):
         st.session_state[f"set_{_k}"] = _s0[_k]
     st.session_state["out_dir_input"] = _s0["out_dir"]
 
@@ -647,7 +692,8 @@ if "saved_settings" not in st.session_state:
 
 # 部品の状態に毎回触れておく。Streamlitは「その回に描画されなかった部品」の状態を
 # 捨てるため、途中で止まる画面(トラック選択など)を挟むとスライダーの値が消えてしまう
-for _k in ("set_percentile", "set_before", "set_after", "set_gap", "set_zoom", "out_dir_input"):
+for _k in ("set_percentile", "set_before", "set_after", "set_gap", "set_zoom",
+           "set_use_audio", "set_use_kill", "out_dir_input"):
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
 
@@ -687,70 +733,82 @@ if not video.is_file():
     render_cache_panel()
     st.stop()
 
-# この動画に実際に入っている音声トラックだけを選べるようにする
+# 動画の情報。長さは音声ではなく動画本体から取る(音量を使わない場合もあるため)
 tracks = load_tracks(str(video.resolve()), video.stat().st_mtime)
-if tracks is not None and not tracks:
-    st.error("この動画には音声が入っていません。別の動画を選んでください。")
-    render_cache_panel()
+total_sec = ac.probe_duration(video) or 0.0
+if total_sec <= 0:
+    st.error("動画の長さを取得できませんでした。ファイルが壊れている可能性があります。")
+    render_cache_panel(video)
     st.stop()
-
-if tracks is None:
-    track = st.number_input(
-        "音声トラック", min_value=0, max_value=7, value=ac.CONFIG["audio_track"],
-        help="トラックを自動で調べられませんでした。番号を直接指定してください",
-    )
-elif len(tracks) == 1:
-    track = 0
-    st.caption(
-        f"この動画の音声は1本だけです({ac.describe_track(0, tracks[0])})。"
-        "選ぶ必要はありません。"
-    )
-else:
-    # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
-    # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
-    with st.spinner("それぞれの音声がどんな音か調べています…"):
-        info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
-
-    st.markdown(f"**どの音声で判定しますか?(この動画には {len(tracks)} 本あります)**")
-    st.caption(
-        "試聴は動画の中ほどから15秒です。OBSなどで音を分けて録画した場合、"
-        "マイクだけのトラックを選ぶとゲーム音に埋もれずに自分の声で検出できます。"
-    )
-    sel = st.session_state.get("track_decided")
-    current = sel[1] if sel and sel[0] == str(video.resolve()) else None
-    for i in range(len(tracks)):
-        c_lbl, c_au, c_btn = st.columns([4, 3, 1.6], vertical_alignment="center")
-        mark = "✅ " if i == current else ""
-        c_lbl.markdown(mark + ac.describe_track(i, tracks[i], info[i]["profile"]))
-        if info[i]["sample"]:
-            c_au.audio(info[i]["sample"])
-        else:
-            c_au.caption("試聴を用意できませんでした")
-        if i == current:
-            c_btn.button("使用中", key=f"pick_track_{i}", disabled=True, width="stretch")
-        elif c_btn.button("この音声で解析", key=f"pick_track_{i}", type="primary", width="stretch"):
-            st.session_state["track_decided"] = (str(video.resolve()), i)
-            st.session_state["force_extract"] = True
-            st.rerun()
-    if current is None:
-        st.info(
-            "それぞれ試聴して、判定に使いたい音声の「この音声で解析」を押してください。"
-            "音声の取り込みには少し時間がかかるので、選んでから始めます。"
-        )
-        render_cache_panel(video)
-        st.stop()
-    track = current
-
-wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
-rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
-total_sec = len(rms) * WIN_SEC
-st.caption(f"長さ {ac.sec_to_hms(total_sec)} / 音声トラック {int(track)} を解析対象にしています")
+st.caption(f"長さ {ac.sec_to_hms(total_sec)}")
 
 # ---------------- ② 切り出し方を決める ----------------
 st.subheader("② 切り出し方を決める")
+c_a, c_k = st.columns(2)
+use_audio = c_a.checkbox("🔊 音量が大きい瞬間で探す", key="set_use_audio")
+use_kill = c_k.checkbox(
+    "💥 キル表示「をたおした!」で探す(スプラトゥーン3)", key="set_use_kill",
+    help="画面下に出る「◯◯をたおした!」の表示をお手本画像と照合して探します。"
+         "初回だけ走査に時間がかかります(動画1時間あたり3〜4分)",
+)
+
+# --- 「音量で探す」の準備: 使う音声を決めて取り込む(キル表示だけなら音声は不要) ---
+rms = None
+track = None
+if use_audio:
+    if tracks is not None and not tracks:
+        st.warning("この動画には音声が入っていないため、音量では探せません。")
+    elif tracks is None:
+        track = st.number_input(
+            "音声トラック", min_value=0, max_value=7, value=ac.CONFIG["audio_track"],
+            help="トラックを自動で調べられませんでした。番号を直接指定してください",
+        )
+    elif len(tracks) == 1:
+        track = 0
+    else:
+        # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
+        # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
+        with st.spinner("それぞれの音声がどんな音か調べています…"):
+            info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
+
+        st.markdown(f"**どの音声で音量を測りますか?(この動画には {len(tracks)} 本あります)**")
+        st.caption(
+            "試聴は動画の中ほどから15秒です。OBSなどで音を分けて録画した場合、"
+            "マイクだけのトラックを選ぶとゲーム音に埋もれずに自分の声で検出できます。"
+        )
+        sel = st.session_state.get("track_decided")
+        current = sel[1] if sel and sel[0] == str(video.resolve()) else None
+        for i in range(len(tracks)):
+            c_lbl, c_au, c_btn = st.columns([4, 3, 1.6], vertical_alignment="center")
+            mark = "✅ " if i == current else ""
+            c_lbl.markdown(mark + ac.describe_track(i, tracks[i], info[i]["profile"]))
+            if info[i]["sample"]:
+                c_au.audio(info[i]["sample"])
+            else:
+                c_au.caption("試聴を用意できませんでした")
+            if i == current:
+                c_btn.button("使用中", key=f"pick_track_{i}", disabled=True, width="stretch")
+            elif c_btn.button("この音声を使う", key=f"pick_track_{i}", type="primary", width="stretch"):
+                st.session_state["track_decided"] = (str(video.resolve()), i)
+                st.session_state["force_extract"] = True
+                st.rerun()
+        if current is None:
+            st.info("音量で探すには、試聴して使いたい音声の「この音声を使う」を押してください。")
+        else:
+            track = current
+
+    if track is not None:
+        wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
+        rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
+        if tracks and len(tracks) == 1:
+            st.caption(f"音声は1本だけなので自動で使います({ac.describe_track(0, tracks[0])})")
+
+audio_ready = rms is not None
+
 c1, c2, c3, c4 = st.columns(4)
 percentile = c1.slider(
     "しきい値(上位%)", min_value=95.0, max_value=99.9, step=0.1, key="set_percentile",
+    disabled=not audio_ready,
     help="音量が上位何%なら盛り上がりとみなすか。数字を下げるほど候補が増えます",
 )
 before = c2.slider("何秒前から", 0, 180, step=5, key="set_before")
@@ -760,20 +818,48 @@ gap = c4.slider(
     help="盛り上がり同士がこの秒数以内なら、1本のクリップにまとめます",
 )
 
-threshold = float(np.percentile(rms, percentile))
-times = ac.peak_times(rms, WIN_SEC, percentile)
+threshold = float(np.percentile(rms, percentile)) if audio_ready else 0.0
+
+if not use_audio and not use_kill:
+    st.info("「音量」「キル表示」の少なくとも一方にチェックを入れてください。")
+    render_cache_panel(video)
+    st.stop()
+
+kill_times: list = []
+if use_kill:
+    kill_times = load_kills(video, total_sec)
+    if kill_times is None:
+        st.warning("キル表示を走査できませんでした。")
+        kill_times = []
+audio_times = ac.peak_times(rms, WIN_SEC, percentile) if audio_ready else []
+
+if not audio_ready and not use_kill:
+    # 音量にチェックはあるが、まだ使う音声が決まっていない(案内は上に表示済み)
+    render_cache_panel(video)
+    st.stop()
+
+times = sorted(audio_times + kill_times)
 clips = ac.merge_intervals(times, before, after, gap)
 
 # ---------------- ③ 結果を見る ----------------
 st.subheader(f"③ クリップ候補: {len(clips)} 件")
 if not clips:
-    st.info("候補がありません。しきい値のスライダーを左に動かして条件をゆるめてください。")
+    if audio_ready:
+        st.info("候補がありません。しきい値のスライダーを左に動かして条件をゆるめてください。")
+    else:
+        st.info("キル表示が見つかりませんでした。スプラトゥーン3の1080p録画以外では検出できません。"
+                "「音量で探す」も試してみてください。")
     render_cache_panel(video)
     st.stop()
 
 total_clip_sec = sum(e - s for s, e in clips)
+found = []
+if audio_ready:
+    found.append(f"音量 {len(audio_times)}箇所")
+if use_kill:
+    found.append(f"キル表示 {len(kill_times)}箇所")
 st.caption(
-    f"検出された盛り上がり {len(times)} 箇所 → {len(clips)} 本にまとめました / "
+    f"検出: {' + '.join(found)} → {len(clips)} 本にまとめました / "
     f"合計 {ac.sec_to_hms(total_clip_sec)}(元動画の {total_clip_sec / total_sec:.0%})"
 )
 
@@ -789,13 +875,21 @@ st.session_state["sprite_in_use"] = sprite["path"] if sprite else None
 chart_html, chart_h = volume_chart_html(
     rms, WIN_SEC, threshold, clips, total_sec, sprite, theme(),
     sprite_scale={"標準": 1.0, "大": 1.5, "特大": 2.0}[zoom],
+    kills=kill_times if use_kill else (),
+    show_threshold=audio_ready,
 )
 st.iframe(chart_html, height=chart_h)
+bits = []
+if audio_ready:
+    bits += ["青い線が音量", "破線がしきい値"]
+if use_kill and kill_times:
+    bits.append("上端のオレンジの印がキル表示の瞬間")
 st.caption(
-    "青い線が音量、破線がしきい値です。塗りつぶした帯が実際に切り出される範囲を表します。"
+    ("、".join(bits) + "です。" if bits else "")
+    + "塗りつぶした帯が実際に切り出される範囲を表します。"
     + ("カーソルを合わせると、その瞬間の映像がコマ送りで確認できます。" if sprite else "")
     + (f" (グラフは {MAX_POINTS} 点に間引いていますが、山の高さは保たれます)"
-       if len(rms) > MAX_POINTS else "")
+       if audio_ready and len(rms) > MAX_POINTS else "")
 )
 
 st.dataframe(
