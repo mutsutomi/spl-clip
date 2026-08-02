@@ -389,6 +389,251 @@ def scan_markers_cached(video: Path, cache_dir: Path, duration: float,
     return events
 
 
+# ============ リザルト画面の読み取り(勝敗・キル数・デス数) ============
+# Finishの後に出る画面から成績を読む。
+#   win/lose : 画面左上の「WIN!」「LOSE...」
+#   result   : 「ゲットした表彰」画面。ここの固定位置に「x10」のような白い2桁数字で
+#              キル数・デス数が出る(アイコンの色はインク色で変わるが数字は常に白)
+RESULT_SCREENS = {
+    "win":    {"file": "win_1080p.png",    "region": (0, 0, 480, 240),     "tmpl_size": (103, 47), "threshold": 0.7},
+    "lose":   {"file": "lose_1080p.png",   "region": (0, 0, 480, 240),     "tmpl_size": (103, 47), "threshold": 0.7},
+    "result": {"file": "result_1080p.png", "region": (780, 330, 480, 150), "tmpl_size": (120, 30), "threshold": 0.7},
+}
+KD_STRIP = (1488, 265, 272, 70)   # 「x15 x02 (x06)」が並ぶ帯(1080p)。上に重なるアイコンも含む
+DIGIT_W, DIGIT_H = 16, 24   # 数字1文字の正規化サイズ
+DIGITS_SHEET = ASSETS_DIR / "digits_1080p.png"   # 0〜9を横に並べた見本シート
+
+
+def _result_templates():
+    out = {}
+    for name, m in RESULT_SCREENS.items():
+        t = load_marker_template(ASSETS_DIR / m["file"], m["tmpl_size"])
+        if t is None:
+            return None
+        out[name] = t
+    return out
+
+
+def scan_result_screens(video: Path, finish_t: float, span: float = 75.0):
+    """Finish後の画面から、勝敗と「表彰」画面の時刻を探す"""
+    tmpls = _result_templates()
+    if tmpls is None:
+        return None
+    t0 = finish_t + 3.0
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(t0),
+           "-i", str(video), "-t", str(span),
+           "-vf", f"fps=1,scale={SCAN_W}:{SCAN_H},format=gray", "-f", "rawvideo", "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    n = len(raw) // (SCAN_W * SCAN_H)
+    frames = np.frombuffer(raw[: n * SCAN_W * SCAN_H], dtype=np.uint8) \
+        .reshape(n, SCAN_H, SCAN_W).astype(np.float32)
+
+    outcome, t_result = None, None
+    for i, f in enumerate(frames):
+        ts = t0 + i
+        scores = {}
+        for name, m in RESULT_SCREENS.items():
+            x, y, w, h = (v // 3 for v in m["region"])
+            scores[name] = _match_score(f[y:y + h, x:x + w], tmpls[name])
+        if outcome is None:
+            if scores["win"] >= RESULT_SCREENS["win"]["threshold"] and scores["win"] > scores["lose"]:
+                outcome = True
+            elif scores["lose"] >= RESULT_SCREENS["lose"]["threshold"] and scores["lose"] > scores["win"]:
+                outcome = False
+        if t_result is None and scores["result"] >= RESULT_SCREENS["result"]["threshold"]:
+            t_result = ts
+        if outcome is not None and t_result is not None:
+            break
+    return {"win": outcome, "t_result": t_result}
+
+
+def _normalize_glyph(white: np.ndarray):
+    rows = white.sum(axis=1).nonzero()[0]
+    if len(rows) < 5:
+        return None
+    im = white[rows[0]:rows[-1] + 1].astype(np.float32)
+    yi = (np.arange(DIGIT_H) * im.shape[0] / DIGIT_H).astype(int)
+    xi = (np.arange(DIGIT_W) * im.shape[1] / DIGIT_W).astype(int)
+    return im[yi][:, xi]
+
+
+def _col_blobs(white: np.ndarray, min_w: int = 2):
+    """白が続く列の塊 [(x0, x1), ...] を返す"""
+    cols = white.sum(axis=0)
+    blobs, start = [], None
+    for i, c in enumerate(list(cols) + [0]):
+        if c > 0 and start is None:
+            start = i
+        elif c == 0 and start is not None:
+            if i - start >= min_w:
+                blobs.append((start, i))
+            start = None
+    return blobs
+
+
+def parse_kd_strip(strip_gray: np.ndarray) -> list[list[np.ndarray]]:
+    """「x15 x02 …」の帯から、各項目の数字グリフ(2文字)を取り出す。
+
+    帯の上にはアイコンが重なっているので、まず「一番下の文字の行帯」を探し、
+    その中で列ごとに文字を切る。各項目は「x」+2桁で、xは数字より背が低いので除く。
+    """
+    white = strip_gray > 180
+    # 行方向の帯を探す(2行以上の空白で区切る)。数字は一番下の帯にある
+    rows = white.sum(axis=1)
+    bands, start = [], None
+    for i, r in enumerate(list(rows) + [0, 0]):
+        if r > 0 and start is None:
+            start = i
+        elif r == 0 and start is not None:
+            if i - start >= 14:
+                bands.append((start, i))
+            start = None
+    if not bands:
+        return []
+    y0, y1 = bands[-1]
+    band = white[y0:y1]
+    band_h = y1 - y0
+
+    # 列の塊 → 間隔15px以上で項目(キル/デス/スペシャル)に分ける
+    blobs = _col_blobs(band)
+    groups, cur = [], []
+    for b in blobs:
+        if cur and b[0] - cur[-1][1] >= 15:
+            groups.append(cur)
+            cur = []
+        cur.append(b)
+    if cur:
+        groups.append(cur)
+
+    items = []
+    for g in groups:
+        # 「x」は数字より背が低いので除外。残りが数字
+        digits = []
+        for x0, x1 in g:
+            sub = band[:, x0:x1]
+            r = sub.sum(axis=1).nonzero()[0]
+            h = (r[-1] - r[0] + 1) if len(r) else 0
+            if h >= band_h * 0.75:
+                digits.append((x0, x1))
+        # 2桁がくっついて1塊になった場合は真ん中で割る
+        if len(digits) == 1 and digits[0][1] - digits[0][0] >= 20:
+            x0, x1 = digits[0]
+            mid = (x0 + x1) // 2
+            digits = [(x0, mid), (mid, x1)]
+        glyphs = [n for x0, x1 in digits[:2]
+                  if (n := _normalize_glyph(band[:, x0:x1])) is not None]
+        items.append(glyphs)
+    return items
+
+
+def _load_digit_sheet():
+    """0〜9の見本シートを読み込む(無ければ None)"""
+    if not DIGITS_SHEET.is_file():
+        return None
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(DIGITS_SHEET),
+           "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if len(raw) < DIGIT_W * 10 * DIGIT_H:
+        return None
+    sheet = np.frombuffer(raw[: DIGIT_W * 10 * DIGIT_H], dtype=np.uint8) \
+        .reshape(DIGIT_H, DIGIT_W * 10).astype(np.float32)
+    return [sheet[:, i * DIGIT_W:(i + 1) * DIGIT_W] / 255.0 for i in range(10)]
+
+
+def _classify_digit(glyph: np.ndarray, sheet) -> int | None:
+    best, best_d = -1.0, None
+    for d, ref in enumerate(sheet):
+        if ref.max() < 0.5:   # シートに無い数字(空欄)
+            continue
+        a = glyph - glyph.mean()
+        b = ref - ref.mean()
+        s = float((a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6))
+        if s > best:
+            best, best_d = s, d
+    return best_d if best > 0.5 else None
+
+
+def kd_strip_at(video: Path, t: float) -> np.ndarray | None:
+    """「表彰」画面のフレームから数字の帯を切り出す"""
+    x, y, w, h = KD_STRIP
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(t),
+           "-i", str(video), "-frames:v", "1",
+           "-vf", f"scale=1920:1080,format=gray,crop={w}:{h}:{x}:{y}", "-f", "rawvideo", "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    if len(raw) < w * h:
+        return None
+    return np.frombuffer(raw[: w * h], dtype=np.uint8).reshape(h, w).astype(np.float32)
+
+
+def read_kd(video: Path, t: float) -> dict:
+    """「表彰」画面のフレームからキル数・デス数を読む。読めなければ None を入れる。
+
+    画面の表示時間は操作しだいで短いことがあるので、前後の数フレームを順に試す。
+    """
+    out = {"kills": None, "deaths": None}
+    sheet = _load_digit_sheet()
+    if sheet is None:
+        return out
+    for dt in (1.0, 0.5, 0.0, 1.5, 2.5):
+        strip = kd_strip_at(video, t + dt)
+        if strip is None:
+            continue
+        items = parse_kd_strip(strip)
+        if len(items) >= 2 and len(items[0]) == 2 and len(items[1]) == 2:
+            got = {}
+            for key, glyphs in zip(("kills", "deaths"), items):
+                d1 = _classify_digit(glyphs[0], sheet)
+                d2 = _classify_digit(glyphs[1], sheet)
+                if d1 is not None and d2 is not None:
+                    got[key] = d1 * 10 + d2
+            if len(got) == 2:
+                return got
+    return out
+
+
+def analyze_matches(video: Path, matches, kills, on_progress=None) -> list[dict]:
+    """各試合の成績(勝敗・キル数・デス数・キル表示回数)を調べる"""
+    rows = []
+    for i, (s, e) in enumerate(matches):
+        finish_t = e - 4.0   # pair_matches が Finish+4秒 を終端にしている
+        res = scan_result_screens(video, finish_t) or {}
+        kd = read_kd(video, res["t_result"] + 1.0) if res.get("t_result") else {}
+        shown = sum(1 for t in kills if s <= t <= e)
+        rows.append({
+            "start": s, "end": e, "win": res.get("win"),
+            "kills": kd.get("kills"), "deaths": kd.get("deaths"),
+            "kills_shown": shown,
+        })
+        if on_progress:
+            on_progress((i + 1) / len(matches))
+    return rows
+
+
+def results_cache_path(video: Path, cache_dir: Path) -> Path:
+    return cache_path(video, cache_dir, "results", "json")
+
+
+def analyze_matches_cached(video: Path, cache_dir: Path, matches, kills,
+                           on_progress=None, refresh: bool = False) -> list[dict]:
+    """試合分析の結果をキャッシュ付きで返す(試合数×数秒かかるため)"""
+    p = results_cache_path(video, cache_dir)
+    key = [round(float(s), 1) for s, _ in matches]
+    if p.exists() and not refresh:
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if d.get("key") == key and isinstance(d.get("rows"), list):
+                return d["rows"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    rows = analyze_matches(video, matches, kills, on_progress=on_progress)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"key": key, "rows": rows}), encoding="utf-8")
+    return rows
+
+
 def pair_matches(starts, finishes, duration: float,
                  lead: float = 2.0, tail: float = 4.0) -> list[list[float]]:
     """開始/Finishの時刻から試合区間を組み立てる。
@@ -464,6 +709,20 @@ def merge_intervals(times, before, after, gap):
         else:
             groups.append([t, t])
     return [[max(0.0, s - before), e + after] for s, e in groups]
+
+
+def merge_intervals_within(times, spans, before, after, gap) -> list[list[float]]:
+    """検出時刻を試合区間の中だけでクリップ化する。
+
+    区間ごとに merge_intervals を適用し、クリップが試合の外(ロビー画面など)へ
+    はみ出さないよう区間の端で切り詰める。
+    """
+    out = []
+    for s, e in spans:
+        inside = [t for t in times if s <= t <= e]
+        for c0, c1 in merge_intervals(inside, before, after, gap):
+            out.append([max(c0, s), min(c1, e)])
+    return out
 
 
 def main():
