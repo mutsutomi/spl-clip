@@ -260,110 +260,152 @@ def mix_preview(clip: Path, out: Path, n_tracks: int):
            "-c:v", "copy", "-c:a", "aac", "-b:a", 192_000, out)
 
 
-# ============ キル表示(「をたおした!」)の検出 ============
-# スプラトゥーン3では、敵をたおすと画面下端の決まった位置に「◯◯をたおした!」が出る。
-# その帯を1秒ごとに切り出し、同梱のお手本画像と照合して一致した時刻を「キルの瞬間」とする。
+# ============ 画面表示マーカー(お手本画像との照合)の検出 ============
+# スプラトゥーン3の決まった画面表示を、同梱のお手本画像と照合して時刻を特定する。
+#   kill   : 「◯◯をたおした!」(画面下端。ハイライト検出に使う)
+#   start  : 「バトルを開始します!」(画面中央。試合の始まりの目印)
+#   finish : 「Finish!」のテープ(配置は毎回同じ。試合の終わりの目印)
+# 走査は動画を1/3縮小(640x360)でデコードし、1回のデコードで全マーカーを評価する。
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-KILL_TEMPLATE = ASSETS_DIR / "taoshita_1080p.png"
-KILL_BAND = (600, 960, 720, 96)   # 1080p基準の帯: x, y, 幅, 高さ(他解像度は高さ比で換算)
-KILL_SCAN_W, KILL_SCAN_H = 240, 32   # 照合は縮小して行う(精度は実測で確認済み)
-KILL_TMPL_W, KILL_TMPL_H = 60, 14
-KILL_THRESHOLD = 0.8   # 一致度のしきい値。表示中は0.99前後、非表示時は0.6以下(実測)
+KILL_TEMPLATE = ASSETS_DIR / "taoshita_1080p.png"   # 後方互換のため残す
+
+SCAN_W, SCAN_H = 640, 360   # 走査時の画面サイズ(1080pの1/3。16:9前提)
+SCAN_FPS = 2                # 秒2コマ。開始画面の表示が約1.3秒しかないため
+
+# region は1080p基準の探索範囲 (x, y, w, h)。tmpl_size は1/3縮小後のお手本サイズ。
+# threshold は実測にもとづく(表示中/非表示のスコアが十分離れる値)
+MARKERS = {
+    "kill": {
+        "file": "taoshita_1080p.png", "region": (600, 960, 720, 96),
+        "tmpl_size": (60, 14), "threshold": 0.8,
+    },
+    "start": {
+        "file": "battle_start_1080p.png", "region": (600, 500, 720, 120),
+        "tmpl_size": (113, 13), "threshold": 0.65,
+    },
+    "finish": {
+        "file": "finish_1080p.png", "region": (120, 730, 480, 200),
+        "tmpl_size": (120, 40), "threshold": 0.7,
+    },
+}
 
 
-def load_kill_template(path: Path | None = None):
+def load_marker_template(path: Path, size: tuple[int, int]):
     """お手本画像を照合用の縮小グレースケールとして読み込む"""
-    p = Path(path) if path else KILL_TEMPLATE
-    if not p.is_file():
+    if not path.is_file():
         return None
-    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(p),
-           "-vf", f"scale={KILL_TMPL_W}:{KILL_TMPL_H},format=gray", "-f", "rawvideo", "-"]
+    w, h = size
+    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-vf", f"scale={w}:{h},format=gray", "-f", "rawvideo", "-"]
     try:
         raw = subprocess.run(cmd, capture_output=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
-    if len(raw) < KILL_TMPL_W * KILL_TMPL_H:
+    if len(raw) < w * h:
         return None
-    t = np.frombuffer(raw[: KILL_TMPL_W * KILL_TMPL_H], dtype=np.uint8) \
-        .astype(np.float32).reshape(KILL_TMPL_H, KILL_TMPL_W)
+    t = np.frombuffer(raw[: w * h], dtype=np.uint8).astype(np.float32).reshape(h, w)
     return (t - t.mean()) / (t.std() + 1e-6)
 
 
-def _kill_band_frames(video: Path, start: float, dur: float, size: tuple[int, int]):
-    """キル表示が出る帯だけを1秒ごとに切り出す(小さいのでデコード以外のコストはほぼゼロ)"""
-    w, h = size
-    s = h / 1080.0
-    x, y, bw, bh = (round(v * s) for v in KILL_BAND)
-    x = max(0, min(x, w - bw))
-    cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(start),
-           "-i", str(video), "-t", str(dur),
-           "-vf", f"fps=1,crop={bw}:{bh}:{x}:{y},scale={KILL_SCAN_W}:{KILL_SCAN_H},format=gray",
-           "-f", "rawvideo", "-"]
-    raw = subprocess.run(cmd, capture_output=True).stdout
-    n = len(raw) // (KILL_SCAN_W * KILL_SCAN_H)
-    return np.frombuffer(raw[: n * KILL_SCAN_W * KILL_SCAN_H], dtype=np.uint8) \
-        .reshape(n, KILL_SCAN_H, KILL_SCAN_W).astype(np.float32)
-
-
 def _match_score(frame, tmpl) -> float:
-    """帯の中でお手本と一番似ている場所の一致度(-1〜1)。名前の長さで表示位置がずれても拾える"""
-    w = sliding_window_view(frame, (KILL_TMPL_H, KILL_TMPL_W))
+    """探索範囲の中でお手本と一番似ている場所の一致度(-1〜1)。
+
+    位置は2ピクセル刻みで探す(4倍速)。1ピクセルずれても一致度の低下は
+    わずかで、しきい値には十分な余裕を取ってある。
+    """
+    th, tw = tmpl.shape
+    if frame.shape[0] < th or frame.shape[1] < tw or frame.std() < 1:
+        return 0.0
+    w = sliding_window_view(frame, (th, tw))[::2, ::2]
     mu = w.mean(axis=(2, 3), keepdims=True)
     sd = w.std(axis=(2, 3), keepdims=True) + 1e-6
     ncc = np.einsum("ijkl,kl->ij", (w - mu) / sd, tmpl) / tmpl.size
     return float(ncc.max())
 
 
-def scan_kills(video: Path, duration: float, template=None,
-               threshold: float = KILL_THRESHOLD, chunk: float = 300.0,
-               on_progress=None) -> list[float] | None:
-    """キル表示が現れた時刻(秒)のリストを返す。走査できない場合は None。
+def scan_markers(video: Path, duration: float, chunk: float = 120.0,
+                 on_progress=None) -> dict[str, list[float]] | None:
+    """全マーカーの出現時刻をまとめて走査する。走査できない場合は None。
 
-    表示は数秒続くので、連続して一致している間は最初の1秒だけを記録する。
+    表示が続いている間は最初の1コマだけを記録する。処理時間はデコードが
+    ほぼすべてなので、マーカーが増えても走査時間は変わらない。
     """
-    tmpl = template if isinstance(template, np.ndarray) else load_kill_template(template)
-    size = probe_size(video)
-    if tmpl is None or size is None:
-        return None
+    tmpls = {}
+    for name, m in MARKERS.items():
+        t = load_marker_template(ASSETS_DIR / m["file"], m["tmpl_size"])
+        if t is None:
+            return None
+        tmpls[name] = t
 
-    events: list[float] = []
-    prev_hit = False
+    events: dict[str, list[float]] = {n: [] for n in MARKERS}
+    prev = {n: False for n in MARKERS}
     t0 = 0.0
     while t0 < duration:
         d = min(chunk, duration - t0)
-        for i, f in enumerate(_kill_band_frames(video, t0, d, size)):
-            hit = _match_score(f, tmpl) >= threshold
-            if hit and not prev_hit:
-                events.append(t0 + i)
-            prev_hit = hit
+        cmd = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", str(t0),
+               "-i", str(video), "-t", str(d),
+               "-vf", f"fps={SCAN_FPS},scale={SCAN_W}:{SCAN_H},format=gray",
+               "-f", "rawvideo", "-"]
+        raw = subprocess.run(cmd, capture_output=True).stdout
+        n = len(raw) // (SCAN_W * SCAN_H)
+        frames = np.frombuffer(raw[: n * SCAN_W * SCAN_H], dtype=np.uint8) \
+            .reshape(n, SCAN_H, SCAN_W).astype(np.float32)
+        for i, f in enumerate(frames):
+            ts = t0 + i / SCAN_FPS
+            for name, m in MARKERS.items():
+                x, y, w, h = (v // 3 for v in m["region"])
+                hit = _match_score(f[y:y + h, x:x + w], tmpls[name]) >= m["threshold"]
+                if hit and not prev[name]:
+                    events[name].append(ts)
+                prev[name] = hit
         t0 += chunk
         if on_progress:
             on_progress(min(1.0, t0 / duration))
     return events
 
 
-def kills_cache_path(video: Path, cache_dir: Path) -> Path:
-    """キル走査の結果キャッシュ(JSON)のパス"""
-    return cache_path(video, cache_dir, "kills", "json")
+def markers_cache_path(video: Path, cache_dir: Path) -> Path:
+    """マーカー走査の結果キャッシュ(JSON)のパス"""
+    return cache_path(video, cache_dir, "markers", "json")
 
 
-def scan_kills_cached(video: Path, cache_dir: Path, duration: float,
-                      on_progress=None, refresh: bool = False) -> list[float] | None:
-    """キル走査の結果をキャッシュ付きで返す。走査は動画1時間あたり3〜4分かかるため"""
-    p = kills_cache_path(video, cache_dir)
+def scan_markers_cached(video: Path, cache_dir: Path, duration: float,
+                        on_progress=None, refresh: bool = False) -> dict[str, list[float]] | None:
+    """マーカー走査の結果をキャッシュ付きで返す(走査は動画1時間あたり3〜4分かかるため)"""
+    p = markers_cache_path(video, cache_dir)
     if p.exists() and not refresh:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(d.get("times"), list):
-                return [float(t) for t in d["times"]]
+            mk = d.get("markers")
+            if isinstance(mk, dict) and all(isinstance(mk.get(n), list) for n in MARKERS):
+                return {n: [float(t) for t in mk[n]] for n in MARKERS}
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass  # 壊れたキャッシュは作り直す
-    times = scan_kills(video, duration, on_progress=on_progress)
-    if times is None:
+            pass  # 壊れた・古い形式のキャッシュは作り直す
+    events = scan_markers(video, duration, on_progress=on_progress)
+    if events is None:
         return None
     cache_dir.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"times": times}), encoding="utf-8")
-    return times
+    p.write_text(json.dumps({"version": 1, "markers": events}), encoding="utf-8")
+    return events
+
+
+def pair_matches(starts, finishes, duration: float,
+                 lead: float = 2.0, tail: float = 4.0) -> list[list[float]]:
+    """開始/Finishの時刻から試合区間を組み立てる。
+
+    「開始 → 次のFinish」を1試合とする。開始が2回続いた場合(回線落ちなどで
+    Finishが無い試合)は、後の開始を採用して前を捨てる。
+    """
+    events = sorted([(t, 0) for t in starts] + [(t, 1) for t in finishes])
+    matches = []
+    cur = None
+    for t, kind in events:
+        if kind == 0:
+            cur = t
+        elif cur is not None and t > cur:
+            matches.append([max(0.0, cur - lead), min(duration, t + tail)])
+            cur = None
+    return matches
 
 
 def extract_track_audio(clip: Path, out: Path, track: int):
@@ -470,15 +512,15 @@ def main():
         if dur is None:
             sys.exit("動画の長さを取得できませんでした")
         print("[kill] キル表示を走査中...(初回のみ。動画1時間あたり3〜4分)")
-        kills = scan_kills_cached(
+        markers = scan_markers_cached(
             args.video, args.cache_dir, dur,
             on_progress=lambda p: print(f"\r[kill] {p:4.0%}", end="", flush=True),
         )
         print()
-        if kills is None:
-            sys.exit("キル表示を走査できませんでした(assets/taoshita_1080p.png はありますか?)")
-        print(f"[kill] キル表示: {len(kills)}箇所")
-        times += kills
+        if markers is None:
+            sys.exit("キル表示を走査できませんでした(assets/ のお手本画像はありますか?)")
+        print(f"[kill] キル表示: {len(markers['kill'])}箇所")
+        times += markers["kill"]
     if not times:
         sys.exit("何も検出されませんでした。--percentile を下げるか、--detect を変えて再実行してみてください")
 

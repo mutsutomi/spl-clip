@@ -59,7 +59,10 @@ SETTING_DEFAULTS = {
     "out_dir": str(OUT_DIR.resolve()),
     "use_audio": True,
     "use_kill": False,
+    "mode": "✂ ハイライトを切り出す",
 }
+
+MODE_CHOICES = ("✂ ハイライトを切り出す", "🎮 試合ごとに分割する(スプラトゥーン3)")
 
 
 def load_settings() -> dict:
@@ -91,6 +94,8 @@ def load_settings() -> dict:
     for key in ("use_audio", "use_kill"):
         if isinstance(raw.get(key), bool):
             s[key] = raw[key]
+    if raw.get("mode") in MODE_CHOICES:
+        s["mode"] = raw["mode"]
     return s
 
 
@@ -113,6 +118,8 @@ def current_settings(prev: dict) -> dict:
     for key in ("use_audio", "use_kill"):
         if isinstance(ss.get(f"set_{key}"), bool):
             s[key] = ss[f"set_{key}"]
+    if ss.get("set_mode") in MODE_CHOICES:
+        s["mode"] = ss["set_mode"]
     return s
 
 
@@ -234,19 +241,19 @@ def load_track_info(video_path: str, mtime: float, n_tracks: int):
     return info
 
 
-def load_kills(video: Path, duration: float):
-    """キル表示の時刻一覧。初回だけ走査し、結果はファイルにキャッシュされる"""
+def load_markers(video: Path, duration: float):
+    """画面表示マーカー(キル・開始・Finish)の時刻一覧。初回だけ走査し、結果はキャッシュされる"""
     bar = None
-    if not ac.kills_cache_path(video, CACHE_DIR).exists():
-        bar = st.progress(0.0, text="キル表示を探しています…(この動画では最初の1回だけ)")
-    times = ac.scan_kills_cached(
+    if not ac.markers_cache_path(video, CACHE_DIR).exists():
+        bar = st.progress(0.0, text="画面表示を走査しています…(この動画では最初の1回だけ)")
+    result = ac.scan_markers_cached(
         video, CACHE_DIR, duration,
-        on_progress=(lambda p: bar.progress(p, text=f"キル表示を探しています… {p:.0%}"
+        on_progress=(lambda p: bar.progress(p, text=f"画面表示を走査しています… {p:.0%}"
                                                      "(この動画では最初の1回だけ)")) if bar else None,
     )
     if bar:
         bar.empty()
-    return times
+    return result
 
 
 @st.cache_data(show_spinner=False)
@@ -300,7 +307,7 @@ def render_cache_panel(current_video: Path | None = None):
     in_use = set()
     if current_video:
         in_use = {ac.cache_wav_path(current_video, CACHE_DIR),
-                  ac.kills_cache_path(current_video, CACHE_DIR)}
+                  ac.markers_cache_path(current_video, CACHE_DIR)}
         sprite = st.session_state.get("sprite_in_use")
         if sprite:
             in_use.add(Path(sprite))
@@ -676,7 +683,7 @@ st.title("🎬 盛り上がった瞬間を切り出す")
 if "saved_settings" not in st.session_state:
     st.session_state["saved_settings"] = load_settings()
     _s0 = st.session_state["saved_settings"]
-    for _k in ("percentile", "before", "after", "gap", "zoom", "use_audio", "use_kill"):
+    for _k in ("percentile", "before", "after", "gap", "zoom", "use_audio", "use_kill", "mode"):
         st.session_state[f"set_{_k}"] = _s0[_k]
     st.session_state["out_dir_input"] = _s0["out_dir"]
 
@@ -693,7 +700,7 @@ if "saved_settings" not in st.session_state:
 # 部品の状態に毎回触れておく。Streamlitは「その回に描画されなかった部品」の状態を
 # 捨てるため、途中で止まる画面(トラック選択など)を挟むとスライダーの値が消えてしまう
 for _k in ("set_percentile", "set_before", "set_after", "set_gap", "set_zoom",
-           "set_use_audio", "set_use_kill", "out_dir_input"):
+           "set_use_audio", "set_use_kill", "set_mode", "out_dir_input"):
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
 
@@ -744,105 +751,137 @@ st.caption(f"長さ {ac.sec_to_hms(total_sec)}")
 
 # ---------------- ② 切り出し方を決める ----------------
 st.subheader("② 切り出し方を決める")
-c_a, c_k = st.columns(2)
-use_audio = c_a.checkbox("🔊 音量が大きい瞬間で探す", key="set_use_audio")
-use_kill = c_k.checkbox(
-    "💥 キル表示「をたおした!」で探す(スプラトゥーン3)", key="set_use_kill",
-    help="画面下に出る「◯◯をたおした!」の表示をお手本画像と照合して探します。"
-         "初回だけ走査に時間がかかります(動画1時間あたり3〜4分)",
+mode = st.radio(
+    "モード", list(MODE_CHOICES),
+    horizontal=True, key="set_mode", label_visibility="collapsed",
 )
+match_mode = "試合" in mode
 
-# --- 「音量で探す」の準備: 使う音声を決めて取り込む(キル表示だけなら音声は不要) ---
-rms = None
-track = None
-if use_audio:
-    if tracks is not None and not tracks:
-        st.warning("この動画には音声が入っていないため、音量では探せません。")
-    elif tracks is None:
-        track = st.number_input(
-            "音声トラック", min_value=0, max_value=7, value=ac.CONFIG["audio_track"],
-            help="トラックを自動で調べられませんでした。番号を直接指定してください",
-        )
-    elif len(tracks) == 1:
-        track = 0
-    else:
-        # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
-        # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
-        with st.spinner("それぞれの音声がどんな音か調べています…"):
-            info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
+if match_mode:
+    st.caption(
+        "「バトルを開始します!」と「Finish!」の画面表示を目印に、1試合ずつのファイルに分けます。"
+        "初回だけ走査に時間がかかります(動画1時間あたり3〜4分)。"
+    )
+    mk = load_markers(video, total_sec)
+    if mk is None:
+        st.error("画面表示を走査できませんでした(assets/ のお手本画像を確認してください)。")
+        render_cache_panel(video)
+        st.stop()
+    clips = ac.pair_matches(mk["start"], mk["finish"], total_sec)
+    st.caption(f"検出: 開始画面 {len(mk['start'])}回 / Finish! {len(mk['finish'])}回")
+    if not clips:
+        st.info("試合の切れ目が見つかりませんでした。スプラトゥーン3の1080p録画(バトル)以外では検出できません。")
+        render_cache_panel(video)
+        st.stop()
+    rms = None
+    audio_ready = False
+    threshold = 0.0
+    use_kill = False
+    kill_times: list = []
+    chart_marks, mark_label = mk["finish"], "Finish!"
 
-        st.markdown(f"**どの音声で音量を測りますか?(この動画には {len(tracks)} 本あります)**")
-        st.caption(
-            "試聴は動画の中ほどから15秒です。OBSなどで音を分けて録画した場合、"
-            "マイクだけのトラックを選ぶとゲーム音に埋もれずに自分の声で検出できます。"
-        )
-        sel = st.session_state.get("track_decided")
-        current = sel[1] if sel and sel[0] == str(video.resolve()) else None
-        for i in range(len(tracks)):
-            c_lbl, c_au, c_btn = st.columns([4, 3, 1.6], vertical_alignment="center")
-            mark = "✅ " if i == current else ""
-            c_lbl.markdown(mark + ac.describe_track(i, tracks[i], info[i]["profile"]))
-            if info[i]["sample"]:
-                c_au.audio(info[i]["sample"])
-            else:
-                c_au.caption("試聴を用意できませんでした")
-            if i == current:
-                c_btn.button("使用中", key=f"pick_track_{i}", disabled=True, width="stretch")
-            elif c_btn.button("この音声を使う", key=f"pick_track_{i}", type="primary", width="stretch"):
-                st.session_state["track_decided"] = (str(video.resolve()), i)
-                st.session_state["force_extract"] = True
-                st.rerun()
-        if current is None:
-            st.info("音量で探すには、試聴して使いたい音声の「この音声を使う」を押してください。")
+if not match_mode:
+    c_a, c_k = st.columns(2)
+    use_audio = c_a.checkbox("🔊 音量が大きい瞬間で探す", key="set_use_audio")
+    use_kill = c_k.checkbox(
+        "💥 キル表示「をたおした!」で探す(スプラトゥーン3)", key="set_use_kill",
+        help="画面下に出る「◯◯をたおした!」の表示をお手本画像と照合して探します。"
+             "初回だけ走査に時間がかかります(動画1時間あたり3〜4分)",
+    )
+
+    # --- 「音量で探す」の準備: 使う音声を決めて取り込む(キル表示だけなら音声は不要) ---
+    rms = None
+    track = None
+    if use_audio:
+        if tracks is not None and not tracks:
+            st.warning("この動画には音声が入っていないため、音量では探せません。")
+        elif tracks is None:
+            track = st.number_input(
+                "音声トラック", min_value=0, max_value=7, value=ac.CONFIG["audio_track"],
+                help="トラックを自動で調べられませんでした。番号を直接指定してください",
+            )
+        elif len(tracks) == 1:
+            track = 0
         else:
-            track = current
+            # 音声が複数あるときは、どれを使うか決まるまで取り込みを始めない
+            # (先に取り込むと、選び直したときに無駄な待ち時間が発生するため)
+            with st.spinner("それぞれの音声がどんな音か調べています…"):
+                info = load_track_info(str(video.resolve()), video.stat().st_mtime, len(tracks))
 
-    if track is not None:
-        wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
-        rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
-        if tracks and len(tracks) == 1:
-            st.caption(f"音声は1本だけなので自動で使います({ac.describe_track(0, tracks[0])})")
+            st.markdown(f"**どの音声で音量を測りますか?(この動画には {len(tracks)} 本あります)**")
+            st.caption(
+                "試聴は動画の中ほどから15秒です。OBSなどで音を分けて録画した場合、"
+                "マイクだけのトラックを選ぶとゲーム音に埋もれずに自分の声で検出できます。"
+            )
+            sel = st.session_state.get("track_decided")
+            current = sel[1] if sel and sel[0] == str(video.resolve()) else None
+            for i in range(len(tracks)):
+                c_lbl, c_au, c_btn = st.columns([4, 3, 1.6], vertical_alignment="center")
+                mark = "✅ " if i == current else ""
+                c_lbl.markdown(mark + ac.describe_track(i, tracks[i], info[i]["profile"]))
+                if info[i]["sample"]:
+                    c_au.audio(info[i]["sample"])
+                else:
+                    c_au.caption("試聴を用意できませんでした")
+                if i == current:
+                    c_btn.button("使用中", key=f"pick_track_{i}", disabled=True, width="stretch")
+                elif c_btn.button("この音声を使う", key=f"pick_track_{i}", type="primary", width="stretch"):
+                    st.session_state["track_decided"] = (str(video.resolve()), i)
+                    st.session_state["force_extract"] = True
+                    st.rerun()
+            if current is None:
+                st.info("音量で探すには、試聴して使いたい音声の「この音声を使う」を押してください。")
+            else:
+                track = current
 
-audio_ready = rms is not None
+        if track is not None:
+            wav = ensure_audio(video, int(track), force=st.session_state.pop("force_extract", False))
+            rms = load_rms(str(wav), wav.stat().st_mtime, WIN_SEC)
+            if tracks and len(tracks) == 1:
+                st.caption(f"音声は1本だけなので自動で使います({ac.describe_track(0, tracks[0])})")
 
-c1, c2, c3, c4 = st.columns(4)
-percentile = c1.slider(
-    "しきい値(上位%)", min_value=95.0, max_value=99.9, step=0.1, key="set_percentile",
-    disabled=not audio_ready,
-    help="音量が上位何%なら盛り上がりとみなすか。数字を下げるほど候補が増えます",
-)
-before = c2.slider("何秒前から", 0, 180, step=5, key="set_before")
-after = c3.slider("何秒後まで", 0, 180, step=5, key="set_after")
-gap = c4.slider(
-    "まとめる間隔(秒)", 0, 120, step=5, key="set_gap",
-    help="盛り上がり同士がこの秒数以内なら、1本のクリップにまとめます",
-)
+    audio_ready = rms is not None
 
-threshold = float(np.percentile(rms, percentile)) if audio_ready else 0.0
+    c1, c2, c3, c4 = st.columns(4)
+    percentile = c1.slider(
+        "しきい値(上位%)", min_value=95.0, max_value=99.9, step=0.1, key="set_percentile",
+        disabled=not audio_ready,
+        help="音量が上位何%なら盛り上がりとみなすか。数字を下げるほど候補が増えます",
+    )
+    before = c2.slider("何秒前から", 0, 180, step=5, key="set_before")
+    after = c3.slider("何秒後まで", 0, 180, step=5, key="set_after")
+    gap = c4.slider(
+        "まとめる間隔(秒)", 0, 120, step=5, key="set_gap",
+        help="盛り上がり同士がこの秒数以内なら、1本のクリップにまとめます",
+    )
 
-if not use_audio and not use_kill:
-    st.info("「音量」「キル表示」の少なくとも一方にチェックを入れてください。")
-    render_cache_panel(video)
-    st.stop()
+    threshold = float(np.percentile(rms, percentile)) if audio_ready else 0.0
 
-kill_times: list = []
-if use_kill:
-    kill_times = load_kills(video, total_sec)
-    if kill_times is None:
-        st.warning("キル表示を走査できませんでした。")
-        kill_times = []
-audio_times = ac.peak_times(rms, WIN_SEC, percentile) if audio_ready else []
+    if not use_audio and not use_kill:
+        st.info("「音量」「キル表示」の少なくとも一方にチェックを入れてください。")
+        render_cache_panel(video)
+        st.stop()
 
-if not audio_ready and not use_kill:
-    # 音量にチェックはあるが、まだ使う音声が決まっていない(案内は上に表示済み)
-    render_cache_panel(video)
-    st.stop()
+    kill_times: list = []
+    if use_kill:
+        kill_times = load_kills(video, total_sec)
+        if kill_times is None:
+            st.warning("キル表示を走査できませんでした。")
+            kill_times = []
+    audio_times = ac.peak_times(rms, WIN_SEC, percentile) if audio_ready else []
 
-times = sorted(audio_times + kill_times)
-clips = ac.merge_intervals(times, before, after, gap)
+    if not audio_ready and not use_kill:
+        # 音量にチェックはあるが、まだ使う音声が決まっていない(案内は上に表示済み)
+        render_cache_panel(video)
+        st.stop()
+
+    times = sorted(audio_times + kill_times)
+    clips = ac.merge_intervals(times, before, after, gap)
+    chart_marks, mark_label = (kill_times if use_kill else []), "キル表示"
 
 # ---------------- ③ 結果を見る ----------------
-st.subheader(f"③ クリップ候補: {len(clips)} 件")
+stem = "match" if match_mode else "clip"
+st.subheader(f"③ {'試合' if match_mode else 'クリップ候補'}: {len(clips)} 件")
 if not clips:
     if audio_ready:
         st.info("候補がありません。しきい値のスライダーを左に動かして条件をゆるめてください。")
@@ -853,15 +892,18 @@ if not clips:
     st.stop()
 
 total_clip_sec = sum(e - s for s, e in clips)
-found = []
-if audio_ready:
-    found.append(f"音量 {len(audio_times)}箇所")
-if use_kill:
-    found.append(f"キル表示 {len(kill_times)}箇所")
-st.caption(
-    f"検出: {' + '.join(found)} → {len(clips)} 本にまとめました / "
-    f"合計 {ac.sec_to_hms(total_clip_sec)}(元動画の {total_clip_sec / total_sec:.0%})"
-)
+if match_mode:
+    st.caption(f"合計 {ac.sec_to_hms(total_clip_sec)}(元動画の {total_clip_sec / total_sec:.0%})")
+else:
+    found = []
+    if audio_ready:
+        found.append(f"音量 {len(audio_times)}箇所")
+    if use_kill:
+        found.append(f"キル表示 {len(kill_times)}箇所")
+    st.caption(
+        f"検出: {' + '.join(found)} → {len(clips)} 本にまとめました / "
+        f"合計 {ac.sec_to_hms(total_clip_sec)}(元動画の {total_clip_sec / total_sec:.0%})"
+    )
 
 c_ttl, c_zoom = st.columns([5, 2], vertical_alignment="bottom")
 c_ttl.markdown("**音量の推移**")
@@ -875,15 +917,15 @@ st.session_state["sprite_in_use"] = sprite["path"] if sprite else None
 chart_html, chart_h = volume_chart_html(
     rms, WIN_SEC, threshold, clips, total_sec, sprite, theme(),
     sprite_scale={"標準": 1.0, "大": 1.5, "特大": 2.0}[zoom],
-    kills=kill_times if use_kill else (),
+    kills=chart_marks,
     show_threshold=audio_ready,
 )
 st.iframe(chart_html, height=chart_h)
 bits = []
 if audio_ready:
     bits += ["青い線が音量", "破線がしきい値"]
-if use_kill and kill_times:
-    bits.append("上端のオレンジの印がキル表示の瞬間")
+if chart_marks:
+    bits.append(f"上端のオレンジの印が{mark_label}の瞬間")
 st.caption(
     ("、".join(bits) + "です。" if bits else "")
     + "塗りつぶした帯が実際に切り出される範囲を表します。"
@@ -895,7 +937,7 @@ st.caption(
 st.dataframe(
     [
         {
-            "クリップ": f"clip_{i:03d}",
+            "名前": f"{stem}_{i:03d}",
             "開始": ac.sec_to_hms(s),
             "終了": ac.sec_to_hms(e),
             "長さ(秒)": round(e - s),
@@ -930,9 +972,9 @@ c_prev.button("◀ 前", key="clip_prev", width="stretch",
 c_next.button("次 ▶", key="clip_next", width="stretch",
               disabled=len(clips) < 2, on_click=step_clip, args=(1,))
 pick = c_pick.selectbox(
-    "確認するクリップ候補", options=range(len(clips)),
+    "確認する" + ("試合" if match_mode else "クリップ候補"), options=range(len(clips)),
     format_func=lambda k: (
-        f"clip_{k + 1:03d}: {ac.sec_to_hms(clips[k][0])} 〜 {ac.sec_to_hms(clips[k][1])}"
+        f"{stem}_{k + 1:03d}: {ac.sec_to_hms(clips[k][0])} 〜 {ac.sec_to_hms(clips[k][1])}"
         f" ({clips[k][1] - clips[k][0]:.0f}秒)"
     ),
     key="pick_clip",
@@ -972,7 +1014,7 @@ out_str = c_out.text_input(
 )
 out_dir = Path(out_str.strip().strip('"')).expanduser()
 
-if st.button(f"{len(clips)} 本のクリップを書き出す", type="primary"):
+if st.button(f"{len(clips)} " + ("試合を書き出す" if match_mode else "本のクリップを書き出す"), type="primary"):
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -981,7 +1023,7 @@ if st.button(f"{len(clips)} 本のクリップを書き出す", type="primary"):
     bar = st.progress(0.0, text="準備中…")
     written = []
     for i, (s, e) in enumerate(clips, 1):
-        out = out_dir / f"clip_{i:03d}_{ac.sec_to_hms(s).replace(':', '')}.mp4"
+        out = out_dir / f"{stem}_{i:03d}_{ac.sec_to_hms(s).replace(':', '')}.mp4"
         bar.progress((i - 1) / len(clips), text=f"{out.name} を書き出し中…({i}/{len(clips)})")
         ac.ffmpeg("-ss", f"{s:.1f}", "-i", video, "-t", f"{e - s:.1f}",
                   *ac.CUT_MAP, "-c", "copy", out)
